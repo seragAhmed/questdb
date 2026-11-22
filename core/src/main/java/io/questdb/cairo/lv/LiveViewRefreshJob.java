@@ -32,6 +32,7 @@ import io.questdb.cairo.EntityColumnFilter;
 import io.questdb.cairo.EntryUnavailableException;
 import io.questdb.cairo.FullPartitionFrameCursorFactory;
 import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.MetadataCache;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.PartitionGeometry;
 import io.questdb.cairo.TableReader;
@@ -175,6 +176,7 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
     // Tests swap this logger via reflection through LogFactory.enableGuaranteedLogging().
     @SuppressWarnings("FieldMayBeFinal")
     private static Log LOG = LogFactory.getLog(LiveViewRefreshJob.class);
+    private static final String EXPIRY_PREFLIGHT_DEFERRED = new String("expiry-preflight-deferred");
     // Once sparse publication and arithmetic row positions remove both O(state) and
     // O(interval) follow-up walks, reported-density A/Bs validate a four-row effective
     // posting-index setup gate. Keep the conservative configurable price for every other
@@ -191,6 +193,9 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
     private static final int COMPACTION_MAX_LIVE_FRACTION_PERCENT = 50;
     private static final int COMPACTION_MAX_SOURCE_SEGMENTS = 8;
     private static final int COMPACTION_MIN_SOURCE_SEGMENTS = 2;
+    // Busy workers scan their registry shard at most once per second. Idle turns
+    // retain the immediate fallback so quiet views need not wait for this cadence.
+    private static final long LAG_SCAN_INTERVAL_US = Micros.SECOND_MICROS;
     // Consecutive failed seals that spend the attempts a fault gets before the seal backs
     // off. Below this the seal retries whenever a trigger is due, which can be every flush:
     // a failed seal moves neither the write time nor the row counter, so whatever trigger
@@ -341,6 +346,7 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
     private long frontierStateFoldRows;
     // Fault, race and behaviour points a test installs. Production never replaces NONE.
     private LiveViewRefreshHooks hooks = LiveViewRefreshHooks.NONE;
+    private long lastLagScanUs = Numbers.LONG_NULL;
     // Scratch a lead drain fills for finishLeadRefresh when its rows are kept from readers: the
     // LV table's committed symbol count per output column, indexed by column and filled for
     // SYMBOL columns only, which caps the symbol horizon the lead's slot is stamped with.
@@ -737,6 +743,15 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
     @TestOnly
     public boolean retryPendingLiveViewApplyForTest(LiveViewInstance instance) {
         return retryPendingLiveViewApply(instance);
+    }
+
+    /**
+     * Test-only: drives one view through the real refresh entry point so policy-preflight tests can assert
+     * deferral and failure accounting without relying on notification or fallback-scan timing.
+     */
+    @TestOnly
+    public boolean refreshInstanceForTest(LiveViewInstance instance, long seqTxn) {
+        return refreshInstance(instance, seqTxn);
     }
 
     /**
@@ -17637,14 +17652,16 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
             didWork = true;
             drained++;
         }
-        if (!didWork) {
-            // Notification queue empty: scan all registered views and refresh any whose
-            // base sequencer head is past their last-processed seqTxn. Catches missed /
-            // coalesced commit notifications (e.g., a CREATE that races a writer or a
-            // notification dropped while the worker was busy on another task) and serves
-            // as the periodic FLUSH-EVERY tick this build doesn't yet have a dedicated
-            // timer for.
-            didWork = scanForLaggingViews();
+        final long nowUs = engine.getConfiguration().getMicrosecondClock().getTicks();
+        if (!didWork || lastLagScanUs == Numbers.LONG_NULL || nowUs - lastLagScanUs >= LAG_SCAN_INTERVAL_US) {
+            // Acknowledging a base notification does not mean every dependent advanced:
+            // pending expiry publication, for example, defers work without moving its
+            // watermark. Scan this worker's shard on a bounded cadence even under busy
+            // notification traffic, and retain the immediate idle fallback. Record the
+            // attempt even if no view progresses, so pending publication cannot make
+            // every busy turn scan the registry. Do not short-circuit the scan on didWork.
+            lastLagScanUs = nowUs;
+            didWork |= scanForLaggingViews();
         }
         return didWork;
     }
@@ -18528,386 +18545,395 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
             if (engine.isClosing()) {
                 return false;
             }
-            // Authoritative apply-lag gate, under the refresh latch, and the only place the floor is
-            // cleared. The pre-latch check above races: a worker that reads a satisfied floor there can
-            // be descheduled, and by the time it clears the field another worker has already run a full
-            // cycle under the latch, hit the lag again, and armed a NEWER floor -- which the stale clear
-            // then erases, dropping this view back into a re-drain-every-tick loop. Arming happens under
-            // this latch too (the LiveViewApplyLagException catch below), so checking and clearing here
-            // is atomic against it.
-            if (isApplyLagDeferred(instance, true)) {
+            final String expiryPreflightResult = preflightExpiryPolicy(instance);
+            if (expiryPreflightResult == EXPIRY_PREFLIGHT_DEFERRED) {
+                // Leave the watermark and failure budget untouched. The lag scan retries
+                // even if unrelated notifications keep this worker busy.
                 return false;
             }
-            // Authoritative refresh-retry backoff gate. A peer worker can fault this view and arm
-            // its deadline between this worker's pre-latch check and its taking the latch; arming
-            // happens under this latch, so the re-read here cannot miss it.
-            if (isRefreshRetryDeferred(instance)) {
-                return false;
-            }
-            // A turn runs, so a pause an operator's suspension held the view in is over. Keep it out of
-            // the duration term of the flush-retry streak a fault before it began: RESUME WAL continues the
-            // view from where it stopped, not with a budget the pause spent.
-            instance.endWalSuspensionPause(engine.getConfiguration().getMicrosecondClock().getTicks());
-            // Reconciliation gate. A prior turn's out-of-order repair committed a
-            // REPLACE_RANGE whose inline apply never landed, so the live view's table
-            // does not yet hold the output its WAL carries. Every coordinate this turn
-            // would derive - the lifetime row count, a head checkpoint's lvRowPosition,
-            // a repaired root's position, the consumed watermark - reads that table, so
-            // refresh stays blocked until the block is known applied. Reporting no work
-            // idles the worker instead of spinning a repair that would derive its
-            // numbers from a table missing the rows; scanForLaggingViews re-drives the
-            // apply on each sweep, and a suspended live view waits for an operator
-            // RESUME WAL, serving disk-only behind the seqTxn fence meanwhile.
-            if (!reconcilePendingReplacement(instance)) {
-                return false;
-            }
-            // Labels the refresh body so a compromised timeline recovery
-            // can break straight to the out-of-latch invalidation below, skipping
-            // the refresh + flush that would otherwise materialise the
-            // inconsistent accumulators to disk.
-            refreshBody:
-            try {
-                // A localized out-of-order repair parked on its turn budget. It holds
-                // the pinned base snapshot its bounds were derived against, an
-                // uncommitted replacement and a runtime half-way through the replay, so
-                // no other work may run over this view until it finishes: every
-                // coordinate a turn would derive reads that runtime, and re-planning
-                // would abandon a candidate that is still good. Continue it and return -
-                // the next tick picks the ordinary cadence back up.
-                final LiveViewCheckpointRepairSession suspendedRepair = instance.getSuspendedRepair();
-                if (suspendedRepair != null) {
-                    if (suspendedRepair.getOwner() != this) {
-                        // Another worker's continuation: its pools hold the reader and the
-                        // writer, and its timeline store writer owns the capture. Report no
-                        // work so this worker backs off rather than rescanning the view.
+            invalidationReason = expiryPreflightResult;
+            if (invalidationReason == null) {
+                // Authoritative apply-lag gate, under the refresh latch, and the only place the floor is
+                // cleared. The pre-latch check above races: a worker that reads a satisfied floor there can
+                // be descheduled, and by the time it clears the field another worker has already run a full
+                // cycle under the latch, hit the lag again, and armed a NEWER floor -- which the stale clear
+                // then erases, dropping this view back into a re-drain-every-tick loop. Arming happens under
+                // this latch too (the LiveViewApplyLagException catch below), so checking and clearing here
+                // is atomic against it.
+                if (isApplyLagDeferred(instance, true)) {
+                    return false;
+                }
+                // Authoritative refresh-retry backoff gate. A peer worker can fault this view and arm
+                // its deadline between this worker's pre-latch check and its taking the latch; arming
+                // happens under this latch, so the re-read here cannot miss it.
+                if (isRefreshRetryDeferred(instance)) {
+                    return false;
+                }
+                // A turn runs, so a pause an operator's suspension held the view in is over. Keep it out of
+                // the duration term of the flush-retry streak a fault before it began: RESUME WAL continues the
+                // view from where it stopped, not with a budget the pause spent.
+                instance.endWalSuspensionPause(engine.getConfiguration().getMicrosecondClock().getTicks());
+                // Reconciliation gate. A prior turn's out-of-order repair committed a
+                // REPLACE_RANGE whose inline apply never landed, so the live view's table
+                // does not yet hold the output its WAL carries. Every coordinate this turn
+                // would derive - the lifetime row count, a head checkpoint's lvRowPosition,
+                // a repaired root's position, the consumed watermark - reads that table, so
+                // refresh stays blocked until the block is known applied. Reporting no work
+                // idles the worker instead of spinning a repair that would derive its
+                // numbers from a table missing the rows; scanForLaggingViews re-drives the
+                // apply on each sweep, and a suspended live view waits for an operator
+                // RESUME WAL, serving disk-only behind the seqTxn fence meanwhile.
+                if (!reconcilePendingReplacement(instance)) {
+                    return false;
+                }
+                // Labels the refresh body so a compromised timeline recovery
+                // can break straight to the out-of-latch invalidation below, skipping
+                // the refresh + flush that would otherwise materialise the
+                // inconsistent accumulators to disk.
+                refreshBody:
+                try {
+                    // A localized out-of-order repair parked on its turn budget. It holds
+                    // the pinned base snapshot its bounds were derived against, an
+                    // uncommitted replacement and a runtime half-way through the replay, so
+                    // no other work may run over this view until it finishes: every
+                    // coordinate a turn would derive reads that runtime, and re-planning
+                    // would abandon a candidate that is still good. Continue it and return -
+                    // the next tick picks the ordinary cadence back up.
+                    final LiveViewCheckpointRepairSession suspendedRepair = instance.getSuspendedRepair();
+                    if (suspendedRepair != null) {
+                        if (suspendedRepair.getOwner() != this) {
+                            // Another worker's continuation: its pools hold the reader and the
+                            // writer, and its timeline store writer owns the capture. Report no
+                            // work so this worker backs off rather than rescanning the view.
+                            return attempted;
+                        }
+                        attempted = true;
+                        resumeSuspendedRepair(instance, suspendedRepair);
+                        instance.recordRefreshSuccess();
                         return attempted;
                     }
-                    attempted = true;
-                    resumeSuspendedRepair(instance, suspendedRepair);
-                    instance.recordRefreshSuccess();
-                    return attempted;
-                }
-                // First cycle after restart restores the newest compatible
-                // timeline root, or rebuilds derived state when the timeline is
-                // absent/unusable. The drain below must never start over durable
-                // output with cold accumulators.
-                // Single-shot per LV lifetime - the flag flips true whether the
-                // restore succeeded, missed, or failed. A base schema change that
-                // lands after the restart compiled its plan does not end the attempt
-                // as a failure: tryRestoreFromTimeline throws the drift to the catch
-                // below, and handleRefreshFailure's drift recovery recompiles and
-                // finishes the recovery, or leaves the window-state debt that keeps
-                // the drain off the runtime until a later turn does.
-                if (!instance.isCheckpointRestoreAttempted()) {
-                    // Reconcile a durable floor left behind by a crash between the
-                    // inline apply and the trailing _lv.s persist, before timeline
-                    // selection reconciles its generation coordinates.
-                    if (!reconcileAppliedFloorAfterRestart(instance)) {
-                        // The view's own WAL holds a block its table has not applied, so
-                        // every coordinate the restore below derives - the floor it clamps,
-                        // the row count and frontier tryRestoreFromTimeline reads - would
-                        // describe rows that are not there. Report no work and leave the
-                        // flag unset so the whole restore retries once the block lands;
-                        // burning it here would make the miss permanent for this view's
-                        // lifetime. A suspended view waits for an operator RESUME WAL,
-                        // serving disk-only meanwhile.
-                        return false;
-                    }
-                    final boolean isSeedActive = instance.getStateReader().getSeedState() == LiveViewState.SEED_STATE_ACTIVE;
-                    if (isSeedActive && instance.isCheckpointUpgradeRebuildPending()) {
-                        // A view carried over from an older checkpoint format rebuilds from
-                        // the applied base below, and the restart route that runs it waits
-                        // for the base's apply in place and invalidates the view durably once
-                        // cairo.live.view.flush.retry.max.duration.micros elapses. A base apply
-                        // backlog is ordinary on the first start after an upgrade, so defer the
-                        // way a running recovery does instead, ahead of the flag: the apply-lag
-                        // catch below arms the back-off with no failure accounting, and the
-                        // attempt is still unmade on the turn that retries it. A
-                        // never-materialized view rebuilds nothing and defers here only while
-                        // the base is behind the view's own watermarks.
-                        ensureBaseAppliedForRebuild(instance, rebuildSnapshotFloor(instance), UPGRADE_REBUILD_CAUSE);
-                        // The base has applied what the rebuild pins, so any wait an earlier turn's
-                        // deferral opened is over. The restart attempt ends in no refresh success of
-                        // its own when there is nothing left to drain, so nothing else would end the
-                        // episode, and base_apply_wait_* would keep reporting it.
-                        instance.clearApplyLagDeferral();
-                    }
-                    instance.setCheckpointRestoreAttempted();
-                    if (isSeedActive) {
-                        // Baseline observability: time bounded generation selection,
-                        // root restore, and the (B,F] replay. Recorded once
-                        // per LV lifetime regardless of outcome, including an attempt
-                        // a cancellation or a base metadata drift ends by throwing.
-                        // Surfaced via live_views().checkpoint_last_restore_micros.
-                        final long restoreStartUs = engine.getConfiguration().getMicrosecondClock().getTicks();
-                        try {
-                            tryRestoreFromTimeline(instance, getWindowFactory(instance));
-                        } catch (Throwable t) {
-                            // An attempt that throws - a restore fault a retry may get past, a fault
-                            // a retry may get past in the applied-base rebuild, a refused rebuild
-                            // behind a restore whose error may not recur, a failed read of the view's
-                            // table, a failed compile - puts no runtime back, and the flag above keeps
-                            // it from running again. It leaves the window-state debt, so the gate of
-                            // the next turn that drives the view, once handleRefreshFailure's back-off
-                            // expires, recovers it before anything drains. handleRefreshFailure
-                            // instead recovers, in this turn, a fault a retry may get past that came
-                            // after the attempt had already marked that debt in this turn - a rebuild
-                            // that wiped the runtime, a replay that fed rows - and before a
-                            // replacement committed. Two such faults differ: a refusal by the
-                            // read-only gate, which handleRefreshFailure never recovers in this turn,
-                            // waits, uncharged, for the next turn that drives the view, and a breach
-                            // of the view's refresh memory limit invalidates the view as any breach
-                            // does. A return leaves the debt as the restore left it: settled, or
-                            // standing where a step inside it - an out-of-order repair that set the
-                            // runtime aside and could not restore its anchor, one that parked - still
-                            // owes the view a recovery.
-                            instance.setWindowStateDirty(true);
-                            throw t;
-                        } finally {
-                            instance.recordCheckpointRestoreMicros(
-                                    engine.getConfiguration().getMicrosecondClock().getTicks() - restoreStartUs
-                            );
+                    // First cycle after restart restores the newest compatible
+                    // timeline root, or rebuilds derived state when the timeline is
+                    // absent/unusable. The drain below must never start over durable
+                    // output with cold accumulators.
+                    // Single-shot per LV lifetime - the flag flips true whether the
+                    // restore succeeded, missed, or failed. A base schema change that
+                    // lands after the restart compiled its plan does not end the attempt
+                    // as a failure: tryRestoreFromTimeline throws the drift to the catch
+                    // below, and handleRefreshFailure's drift recovery recompiles and
+                    // finishes the recovery, or leaves the window-state debt that keeps
+                    // the drain off the runtime until a later turn does.
+                    if (!instance.isCheckpointRestoreAttempted()) {
+                        // Reconcile a durable floor left behind by a crash between the
+                        // inline apply and the trailing _lv.s persist, before timeline
+                        // selection reconciles its generation coordinates.
+                        if (!reconcileAppliedFloorAfterRestart(instance)) {
+                            // The view's own WAL holds a block its table has not applied, so
+                            // every coordinate the restore below derives - the floor it clamps,
+                            // the row count and frontier tryRestoreFromTimeline reads - would
+                            // describe rows that are not there. Report no work and leave the
+                            // flag unset so the whole restore retries once the block lands;
+                            // burning it here would make the miss permanent for this view's
+                            // lifetime. A suspended view waits for an operator RESUME WAL,
+                            // serving disk-only meanwhile.
+                            return false;
                         }
-                        if (instance.hasPendingInvalidationReason()) {
-                            // The restore could not rebuild a consistent window
-                            // state (replay-to-applied failed mid-gap leaving the
-                            // accumulators a partial advance over disk, a dedup
-                            // replay failed, or no safe derived-state rebuild was
-                            // possible). Do NOT run the incremental refresh + flush
-                            // below: they would advance and flush the inconsistent
-                            // accumulators, leaving the (about-to-be-invalidated)
-                            // view serving corrupted content off its own on-disk
-                            // tier - an invalid view stays queryable. Break to the
-                            // out-of-latch invalidation, which drains the stashed
-                            // reason and marks the view invalid without a partial
-                            // advance ever reaching disk.
+                        final boolean isSeedActive = instance.getStateReader().getSeedState() == LiveViewState.SEED_STATE_ACTIVE;
+                        if (isSeedActive && instance.isCheckpointUpgradeRebuildPending()) {
+                            // A view carried over from an older checkpoint format rebuilds from
+                            // the applied base below, and the restart route that runs it waits
+                            // for the base's apply in place and invalidates the view durably once
+                            // cairo.live.view.flush.retry.max.duration.micros elapses. A base apply
+                            // backlog is ordinary on the first start after an upgrade, so defer the
+                            // way a running recovery does instead, ahead of the flag: the apply-lag
+                            // catch below arms the back-off with no failure accounting, and the
+                            // attempt is still unmade on the turn that retries it. A
+                            // never-materialized view rebuilds nothing and defers here only while
+                            // the base is behind the view's own watermarks.
+                            ensureBaseAppliedForRebuild(instance, rebuildSnapshotFloor(instance), UPGRADE_REBUILD_CAUSE);
+                            // The base has applied what the rebuild pins, so any wait an earlier turn's
+                            // deferral opened is over. The restart attempt ends in no refresh success of
+                            // its own when there is nothing left to drain, so nothing else would end the
+                            // episode, and base_apply_wait_* would keep reporting it.
+                            instance.clearApplyLagDeferral();
+                        }
+                        instance.setCheckpointRestoreAttempted();
+                        if (isSeedActive) {
+                            // Baseline observability: time bounded generation selection,
+                            // root restore, and the (B,F] replay. Recorded once
+                            // per LV lifetime regardless of outcome, including an attempt
+                            // a cancellation or a base metadata drift ends by throwing.
+                            // Surfaced via live_views().checkpoint_last_restore_micros.
+                            final long restoreStartUs = engine.getConfiguration().getMicrosecondClock().getTicks();
+                            try {
+                                tryRestoreFromTimeline(instance, getWindowFactory(instance));
+                            } catch (Throwable t) {
+                                // An attempt that throws - a restore fault a retry may get past, a fault
+                                // a retry may get past in the applied-base rebuild, a refused rebuild
+                                // behind a restore whose error may not recur, a failed read of the view's
+                                // table, a failed compile - puts no runtime back, and the flag above keeps
+                                // it from running again. It leaves the window-state debt, so the gate of
+                                // the next turn that drives the view, once handleRefreshFailure's back-off
+                                // expires, recovers it before anything drains. handleRefreshFailure
+                                // instead recovers, in this turn, a fault a retry may get past that came
+                                // after the attempt had already marked that debt in this turn - a rebuild
+                                // that wiped the runtime, a replay that fed rows - and before a
+                                // replacement committed. Two such faults differ: a refusal by the
+                                // read-only gate, which handleRefreshFailure never recovers in this turn,
+                                // waits, uncharged, for the next turn that drives the view, and a breach
+                                // of the view's refresh memory limit invalidates the view as any breach
+                                // does. A return leaves the debt as the restore left it: settled, or
+                                // standing where a step inside it - an out-of-order repair that set the
+                                // runtime aside and could not restore its anchor, one that parked - still
+                                // owes the view a recovery.
+                                instance.setWindowStateDirty(true);
+                                throw t;
+                            } finally {
+                                instance.recordCheckpointRestoreMicros(
+                                        engine.getConfiguration().getMicrosecondClock().getTicks() - restoreStartUs
+                                );
+                            }
+                            if (instance.hasPendingInvalidationReason()) {
+                                // The restore could not rebuild a consistent window
+                                // state (replay-to-applied failed mid-gap leaving the
+                                // accumulators a partial advance over disk, a dedup
+                                // replay failed, or no safe derived-state rebuild was
+                                // possible). Do NOT run the incremental refresh + flush
+                                // below: they would advance and flush the inconsistent
+                                // accumulators, leaving the (about-to-be-invalidated)
+                                // view serving corrupted content off its own on-disk
+                                // tier - an invalid view stays queryable. Break to the
+                                // out-of-latch invalidation, which drains the stashed
+                                // reason and marks the view invalid without a partial
+                                // advance ever reaching disk.
+                                break refreshBody;
+                            }
+                            if (instance.isCheckpointRecoveryBlocked()) {
+                                // The restore fell back to the applied-base rebuild and the
+                                // restatement guard refused it. Nothing moved and nothing is
+                                // invalid, but no recovery produced the accumulators either,
+                                // so the drain below must not feed rows over them.
+                                return attempted;
+                            }
+                            if (instance.getSuspendedRepair() != null) {
+                                // The restore's replay met an unresolved out-of-order commit,
+                                // and the repair it handed off to parked on its turn budget.
+                                // The repair owns the runtime until it finishes - the gate
+                                // below would discard it to recover a runtime it is standing
+                                // in, and the drain would feed rows through one half-way
+                                // through a replay - so end the turn: the next one continues it.
+                                return true;
+                            }
+                        }
+                    }
+                    // Seed phase: every view CREATEs in SEEDING state and stays there until the
+                    // sweep has covered everything <= seedTargetSeqTxn, feeding the base rows
+                    // that satisfy its START FROM boundary. The sweep takes priority over
+                    // incremental drain; once it completes, the next refresh tick resumes normal
+                    // incremental processing from seedTargetSeqTxn + 1.
+                    //
+                    // The sweep does not bump lastFlushTimeUs - the FLUSH EVERY rate limit
+                    // governs steady-state publish cadence, and a view should resume incremental
+                    // drain immediately after the sweep without an artificial 100ms+ stall.
+                    if (instance.getStateReader().getSeedState() == LiveViewState.SEED_STATE_SEEDING) {
+                        attempted = true;
+                        runSeedSweep(instance);
+                        // Clear the flush-retry budget only when the turn proved the sweep got past
+                        // whatever last faulted: it completed, or it committed output past the skip-write
+                        // floor, the LV row count that was on disk when the resume derived it. A mid-seed
+                        // fault that struck after the turn fed a row re-arms the resume,
+                        // which rewinds the sweep to its newest sealed root, and that root can sit
+                        // well below the on-disk output: turns that end on the same max
+                        // timestamp seal no new root, so recovery rewinds and replays rows already on
+                        // disk. A replay turn re-feeds those rows to rebuild the window state and appends
+                        // nothing, so it is no evidence that the faulting row cleared. Recording a success
+                        // for it zeroed the count and the streak clock on every rewind, and a permanent
+                        // fault - a row the LV writer refuses, a base column that no longer reads - then
+                        // re-faulted forever with neither budget able to expire. The resume-attempted
+                        // check covers a turn that left the resume block before sweeping (the LV apply
+                        // lag return): its lvRowsTotal and floor are the stale values a re-arm leaves
+                        // behind, not a measurement of this turn.
+                        if (instance.getStateReader().getSeedState() != LiveViewState.SEED_STATE_SEEDING
+                                || (instance.isSeedResumeAttempted()
+                                && instance.getLvRowsTotal() > instance.getSeedSkipWriteFloor())) {
+                            instance.recordRefreshSuccess();
+                        }
+                        return attempted;
+                    }
+                    // A previous turn wiped or half-advanced the accumulators, or lost them
+                    // with a drifted factory, and its own recovery failed, so the runtime still
+                    // disagrees with the durable tier. Draining forward from here would commit
+                    // cumulative output derived from that runtime and then call
+                    // recordRefreshSuccess(), which resets the flush-retry budget - so the view
+                    // would serve wrong totals and never invalidate itself out of them. Put the
+                    // accumulators back first: restored from the timeline, or rebuilt from the
+                    // applied base when the restore cannot run. A recovery that fails again
+                    // charges the budget through handleRefreshFailure until it exhausts and the
+                    // view invalidates honestly, so this terminates either way; a restore that
+                    // succeeds settles the debt itself, and a rebuild that succeeds commits,
+                    // which clears it.
+                    if (instance.isWindowStateDirty()) {
+                        attempted = true;
+                        final long processedBeforeRecovery = instance.getLastProcessedSeqTxn();
+                        final Throwable recoveryErr = recoverWindowStateAfterMidDrainFailure(instance);
+                        if (recoveryErr != null) {
+                            // Already recovered-and-failed here, so stop handleRefreshFailure
+                            // repeating it for this turn; the debt stays on the instance.
+                            windowStateDirty = false;
+                            invalidationReason = handleRefreshFailure(instance, recoveryErr);
                             break refreshBody;
                         }
                         if (instance.isCheckpointRecoveryBlocked()) {
-                            // The restore fell back to the applied-base rebuild and the
-                            // restatement guard refused it. Nothing moved and nothing is
-                            // invalid, but no recovery produced the accumulators either,
-                            // so the drain below must not feed rows over them.
+                            // Refused rather than rebuilt: the view stops here, its debt with it.
                             return attempted;
                         }
+                        // The turn that left the debt was charged for its fault. A recovery that moved
+                        // the view forward got past the commits that fault stopped, so it ends that
+                        // streak here, as it does in handleRefreshFailure. Left standing, the streak
+                        // would take a fault later in this turn as its next retry, still measured
+                        // from a first fault the view is already past.
+                        tryEndRetryStreakAfterRecovery(instance, processedBeforeRecovery);
                         if (instance.getSuspendedRepair() != null) {
-                            // The restore's replay met an unresolved out-of-order commit,
-                            // and the repair it handed off to parked on its turn budget.
-                            // The repair owns the runtime until it finishes - the gate
-                            // below would discard it to recover a runtime it is standing
-                            // in, and the drain would feed rows through one half-way
-                            // through a replay - so end the turn: the next one continues it.
-                            return true;
+                            // The restore handed off to an out-of-order repair that parked, as
+                            // above: it owns the runtime until the next turn continues it.
+                            return attempted;
+                        }
+                        windowStateDirty = instance.isWindowStateDirty();
+                    }
+                    // Decide the cadence. A lead-eligible LV decouples refresh (drain
+                    // into the in-mem tier as the un-flushed lead, every tick with new
+                    // base commits) from flush (commit + apply + checkpoint, on the
+                    // FLUSH EVERY cadence). A coupled LV keeps the coupled cycle, gated by
+                    // FLUSH EVERY, applying every cycle so the tier stays a subset of disk.
+                    // Two things force the coupled cadence: a tier-unstorable output type
+                    // (a non-persisted type such as INTERVAL, or no designated timestamp),
+                    // which ensureLeadEligible rejects one-shot; and a DEDUP base, which
+                    // isDedupBase re-derives each cycle (mutable via ALTER). A dedup base
+                    // additionally reads the applied (post-dedup) base instead of raw WAL.
+                    final boolean dedupBase = isDedupBase(instance);
+                    // A read-only replica reads the applied base (see prefersAppliedBaseRefresh) via the
+                    // coupled drainAppliedBase path, exactly like a DEDUP base: no un-flushed in-RAM lead,
+                    // the tier stays a subset of disk. So it is never lead-eligible.
+                    final boolean appliedBase = prefersAppliedBaseRefresh();
+                    final boolean leadEligible = ensureLeadEligible(instance) && !dedupBase && !appliedBase;
+                    final long nowUs = engine.getConfiguration().getMicrosecondClock().getTicks();
+                    final long lastFlushUs = instance.getLastFlushTimeUs();
+                    final long flushEveryMicros = instance.getDefinition().getFlushEveryMicros();
+                    final boolean flushDue = lastFlushUs == Numbers.LONG_NULL || nowUs - lastFlushUs >= flushEveryMicros;
+                    if (leadEligible) {
+                        long refreshFrom = instance.getRefreshedUpToSeqTxn();
+                        if (seqTxn > refreshFrom) {
+                            // Refresh runs every tick with new base commits, ungated by
+                            // FLUSH EVERY, so the tier leads disk by the rows refreshed
+                            // since the last flush. TransactionLogCursor treats txnLo as
+                            // exclusive, so pass refreshFrom directly.
+                            attempted = true;
+                            // A drain that cannot read a base WAL segment propagates: handleRefreshFailure
+                            // retries it, and a segment that is genuinely gone (a restore keeps the applied
+                            // base TABLE, not its WAL) lands on the applied-base re-derive there.
+                            incrementalRefresh(instance, refreshFrom, seqTxn, true);
+                        }
+                        // Flush the accumulated lead on the FLUSH EVERY cadence. The refresh may also have
+                        // flushed (emergency, on a tier stall), in which case refreshedUpTo == lastProcessed
+                        // and this is skipped.
+                        if (flushDue && instance.getRefreshedUpToSeqTxn() > instance.getLastProcessedSeqTxn()) {
+                            attempted = true;
+                            // Read before the flush, which zeroes the lead.
+                            final boolean isLeadKeptFromReaders = isPublishedLeadKeptFromReaders(instance);
+                            flushLead(instance, getWindowFactory(instance), instance.getRefreshedUpToSeqTxn(), 0);
+                            // nowUs, not a fresh clock read: see the coupled branch below.
+                            instance.setLastFlushTimeUs(nowUs);
+                            // Restage a stale tier after the flush only when all view WAL is applied. This
+                            // retries the symbol rewind and records progress toward a pinned slot's horizon.
+                            // A pending block leaves reads on disk; restaging below it cannot expose the lead
+                            // and would repeat the same work on every sparse drain.
+                            if (isLeadKeptFromReaders && isLiveViewWalFullyApplied(instance)) {
+                                rebuildInMemoryTier(instance);
+                                final LiveViewInMemoryTier tier = instance.getInMemoryTier();
+                                // Same stamp as the flush cadence: the flush counts as the interval's disk drain.
+                                tier.setStrandedIdDiskRoute(nowUs, tier.getStrandedIdDiskRouteDeficit());
+                            }
+                        }
+                    } else {
+                        long lastSeqTxn = instance.getLastProcessedSeqTxn();
+                        if (seqTxn > lastSeqTxn) {
+                            // FLUSH EVERY rate-limit: skip if the previous commit was within
+                            // flushEveryMicros. The fallback scan retries each worker tick, so
+                            // this view's catch-up resumes naturally once the interval elapses.
+                            // We bump lastFlushTimeUs to nowUs only after a successful refresh,
+                            // so a long-running first commit does not double-charge the budget.
+                            if (!flushDue) {
+                                return attempted;
+                            }
+                            // TransactionLogCursor treats txnLo as exclusive (lastApplied), so we
+                            // pass lastSeqTxn directly. The cursor's getTxn() returns entries with
+                            // seqTxn > lastSeqTxn.
+                            attempted = true;
+                            if (appliedBase) {
+                                // Read-only replica: the raw base WAL races its own async download/apply, so
+                                // always read the applied, post-apply base table. drainAppliedBase pins it
+                                // behind the cooperative apply-lag gate and routes any timestamp overlap
+                                // through o3Replay -- the replica owns and rewrites its own LV disk under
+                                // symmetric refresh. Deliberately bypasses the dedup isRangeProvablyClean
+                                // raw-WAL shortcut: a replica has no settled raw WAL to fast-path against.
+                                drainAppliedBase(instance, lastSeqTxn, seqTxn);
+                            } else if (dedupBase) {
+                                if (isRangeProvablyClean(instance.getDefinition().getBaseTableToken(), lastSeqTxn, seqTxn)) {
+                                    // The applied base provably equals the raw WAL over this
+                                    // range (nothing deduped / skipped / removed). Take the
+                                    // proven raw-WAL path -- it appends additive same-ts rows without
+                                    // the applied-reader over-trigger, and drainBaseWal's own O3
+                                    // detection still routes a genuine below-frontier late row through
+                                    // o3Replay over the applied base.
+                                    incrementalRefresh(instance, lastSeqTxn, seqTxn, false);
+                                    // Coupled invariant: keep refreshedUpTo == lastProcessed (which
+                                    // incrementalRefresh, unlike drainAppliedBase, does not set) so a
+                                    // later ALTER DEDUP DISABLE flip back to the lead path resumes
+                                    // cleanly with no stale un-flushed lead / double emit. Uses
+                                    // getLastProcessedSeqTxn() so a partial or internal-o3Replay cycle
+                                    // stays consistent.
+                                    instance.setRefreshedUpToSeqTxn(instance.getLastProcessedSeqTxn());
+                                    // Coupled invariant: no un-flushed lead on the clean raw-WAL path.
+                                    instance.setLeadRowCount(0);
+                                    instance.bumpDedupRawWalCleanCycles();
+                                } else {
+                                    // Cold signal, apply lag, or a divergence (dedup / skip / non-DATA
+                                    // op) in range: read the applied, post-dedup base via a TableReader
+                                    // and route any timestamp-overlap batch through o3Replay.
+                                    drainAppliedBase(instance, lastSeqTxn, seqTxn);
+                                }
+                            } else {
+                                incrementalRefresh(instance, lastSeqTxn, seqTxn, false);
+                            }
+                            // Stamp the cadence with nowUs, the instant this cycle read the clock and
+                            // found the flush due, not with a fresh read taken after the drain. A
+                            // fresh read charges the cadence for the drain's own duration, so the interval
+                            // drifts by the work it schedules around. With a clock that jumps during the
+                            // drain and then stands still, a fresh read would also keep
+                            // nowUs - lastFlushUs at 0, and the view would never flush again.
+                            instance.setLastFlushTimeUs(nowUs);
                         }
                     }
-                }
-                // Seed phase: every view CREATEs in SEEDING state and stays there until the
-                // sweep has covered everything <= seedTargetSeqTxn, feeding the base rows
-                // that satisfy its START FROM boundary. The sweep takes priority over
-                // incremental drain; once it completes, the next refresh tick resumes normal
-                // incremental processing from seedTargetSeqTxn + 1.
-                //
-                // The sweep does not bump lastFlushTimeUs - the FLUSH EVERY rate limit
-                // governs steady-state publish cadence, and a view should resume incremental
-                // drain immediately after the sweep without an artificial 100ms+ stall.
-                if (instance.getStateReader().getSeedState() == LiveViewState.SEED_STATE_SEEDING) {
-                    attempted = true;
-                    runSeedSweep(instance);
-                    // Clear the flush-retry budget only when the turn proved the sweep got past
-                    // whatever last faulted: it completed, or it committed output past the skip-write
-                    // floor, the LV row count that was on disk when the resume derived it. A mid-seed
-                    // fault that struck after the turn fed a row re-arms the resume,
-                    // which rewinds the sweep to its newest sealed root, and that root can sit
-                    // well below the on-disk output: turns that end on the same max
-                    // timestamp seal no new root, so recovery rewinds and replays rows already on
-                    // disk. A replay turn re-feeds those rows to rebuild the window state and appends
-                    // nothing, so it is no evidence that the faulting row cleared. Recording a success
-                    // for it zeroed the count and the streak clock on every rewind, and a permanent
-                    // fault - a row the LV writer refuses, a base column that no longer reads - then
-                    // re-faulted forever with neither budget able to expire. The resume-attempted
-                    // check covers a turn that left the resume block before sweeping (the LV apply
-                    // lag return): its lvRowsTotal and floor are the stale values a re-arm leaves
-                    // behind, not a measurement of this turn.
-                    if (instance.getStateReader().getSeedState() != LiveViewState.SEED_STATE_SEEDING
-                            || (instance.isSeedResumeAttempted()
-                            && instance.getLvRowsTotal() > instance.getSeedSkipWriteFloor())) {
+                    if (attempted) {
                         instance.recordRefreshSuccess();
                     }
-                    return attempted;
+                } catch (LiveViewApplyLagException e) {
+                    // Apply lag defers without advancing durable output or spending the failure budget.
+                    // The drain may already have fed rows into the accumulators before rolling back its
+                    // WAL draft. Carry that state debt across turns so recovery rebuilds before those
+                    // rows are fed again; a deferral before any row was fed owes no rebuild.
+                    if (windowStateDirty) {
+                        markWindowStateDirty(instance);
+                    }
+                    armApplyLagDeferral(instance, e);
+                    LOG.debug().$("live view refresh deferred, base apply lag [view=")
+                            .$(instance.getDefinition().getViewName())
+                            .$(", base=").$safe(e.getBaseTableName())
+                            .$(", advanceTo=").$(e.getTargetSeqTxn())
+                            .$(", appliedSeqTxn=").$(e.getAppliedSeqTxn()).I$();
+                } catch (Throwable t) {
+                    invalidationReason = handleRefreshFailure(instance, t);
                 }
-                // A previous turn wiped or half-advanced the accumulators, or lost them
-                // with a drifted factory, and its own recovery failed, so the runtime still
-                // disagrees with the durable tier. Draining forward from here would commit
-                // cumulative output derived from that runtime and then call
-                // recordRefreshSuccess(), which resets the flush-retry budget - so the view
-                // would serve wrong totals and never invalidate itself out of them. Put the
-                // accumulators back first: restored from the timeline, or rebuilt from the
-                // applied base when the restore cannot run. A recovery that fails again
-                // charges the budget through handleRefreshFailure until it exhausts and the
-                // view invalidates honestly, so this terminates either way; a restore that
-                // succeeds settles the debt itself, and a rebuild that succeeds commits,
-                // which clears it.
-                if (instance.isWindowStateDirty()) {
-                    attempted = true;
-                    final long processedBeforeRecovery = instance.getLastProcessedSeqTxn();
-                    final Throwable recoveryErr = recoverWindowStateAfterMidDrainFailure(instance);
-                    if (recoveryErr != null) {
-                        // Already recovered-and-failed here, so stop handleRefreshFailure
-                        // repeating it for this turn; the debt stays on the instance.
-                        windowStateDirty = false;
-                        invalidationReason = handleRefreshFailure(instance, recoveryErr);
-                        break refreshBody;
-                    }
-                    if (instance.isCheckpointRecoveryBlocked()) {
-                        // Refused rather than rebuilt: the view stops here, its debt with it.
-                        return attempted;
-                    }
-                    // The turn that left the debt was charged for its fault. A recovery that moved
-                    // the view forward got past the commits that fault stopped, so it ends that
-                    // streak here, as it does in handleRefreshFailure. Left standing, the streak
-                    // would take a fault later in this turn as its next retry, still measured
-                    // from a first fault the view is already past.
-                    tryEndRetryStreakAfterRecovery(instance, processedBeforeRecovery);
-                    if (instance.getSuspendedRepair() != null) {
-                        // The restore handed off to an out-of-order repair that parked, as
-                        // above: it owns the runtime until the next turn continues it.
-                        return attempted;
-                    }
-                    windowStateDirty = instance.isWindowStateDirty();
-                }
-                // Decide the cadence. A lead-eligible LV decouples refresh (drain
-                // into the in-mem tier as the un-flushed lead, every tick with new
-                // base commits) from flush (commit + apply + checkpoint, on the
-                // FLUSH EVERY cadence). A coupled LV keeps the coupled cycle, gated by
-                // FLUSH EVERY, applying every cycle so the tier stays a subset of disk.
-                // Two things force the coupled cadence: a tier-unstorable output type
-                // (a non-persisted type such as INTERVAL, or no designated timestamp),
-                // which ensureLeadEligible rejects one-shot; and a DEDUP base, which
-                // isDedupBase re-derives each cycle (mutable via ALTER). A dedup base
-                // additionally reads the applied (post-dedup) base instead of raw WAL.
-                final boolean dedupBase = isDedupBase(instance);
-                // A read-only replica reads the applied base (see prefersAppliedBaseRefresh) via the
-                // coupled drainAppliedBase path, exactly like a DEDUP base: no un-flushed in-RAM lead,
-                // the tier stays a subset of disk. So it is never lead-eligible.
-                final boolean appliedBase = prefersAppliedBaseRefresh();
-                final boolean leadEligible = ensureLeadEligible(instance) && !dedupBase && !appliedBase;
-                final long nowUs = engine.getConfiguration().getMicrosecondClock().getTicks();
-                final long lastFlushUs = instance.getLastFlushTimeUs();
-                final long flushEveryMicros = instance.getDefinition().getFlushEveryMicros();
-                final boolean flushDue = lastFlushUs == Numbers.LONG_NULL || nowUs - lastFlushUs >= flushEveryMicros;
-                if (leadEligible) {
-                    long refreshFrom = instance.getRefreshedUpToSeqTxn();
-                    if (seqTxn > refreshFrom) {
-                        // Refresh runs every tick with new base commits, ungated by
-                        // FLUSH EVERY, so the tier leads disk by the rows refreshed
-                        // since the last flush. TransactionLogCursor treats txnLo as
-                        // exclusive, so pass refreshFrom directly.
-                        attempted = true;
-                        // A drain that cannot read a base WAL segment propagates: handleRefreshFailure
-                        // retries it, and a segment that is genuinely gone (a restore keeps the applied
-                        // base TABLE, not its WAL) lands on the applied-base re-derive there.
-                        incrementalRefresh(instance, refreshFrom, seqTxn, true);
-                    }
-                    // Flush the accumulated lead on the FLUSH EVERY cadence. The refresh may also have
-                    // flushed (emergency, on a tier stall), in which case refreshedUpTo == lastProcessed
-                    // and this is skipped.
-                    if (flushDue && instance.getRefreshedUpToSeqTxn() > instance.getLastProcessedSeqTxn()) {
-                        attempted = true;
-                        // Read before the flush, which zeroes the lead.
-                        final boolean isLeadKeptFromReaders = isPublishedLeadKeptFromReaders(instance);
-                        flushLead(instance, getWindowFactory(instance), instance.getRefreshedUpToSeqTxn(), 0);
-                        // nowUs, not a fresh clock read: see the coupled branch below.
-                        instance.setLastFlushTimeUs(nowUs);
-                        // Restage a stale tier after the flush only when all view WAL is applied. This
-                        // retries the symbol rewind and records progress toward a pinned slot's horizon.
-                        // A pending block leaves reads on disk; restaging below it cannot expose the lead
-                        // and would repeat the same work on every sparse drain.
-                        if (isLeadKeptFromReaders && isLiveViewWalFullyApplied(instance)) {
-                            rebuildInMemoryTier(instance);
-                            final LiveViewInMemoryTier tier = instance.getInMemoryTier();
-                            // Same stamp as the flush cadence: the flush counts as the interval's disk drain.
-                            tier.setStrandedIdDiskRoute(nowUs, tier.getStrandedIdDiskRouteDeficit());
-                        }
-                    }
-                } else {
-                    long lastSeqTxn = instance.getLastProcessedSeqTxn();
-                    if (seqTxn > lastSeqTxn) {
-                        // FLUSH EVERY rate-limit: skip if the previous commit was within
-                        // flushEveryMicros. The fallback scan retries each worker tick, so
-                        // this view's catch-up resumes naturally once the interval elapses.
-                        // We bump lastFlushTimeUs to nowUs only after a successful refresh,
-                        // so a long-running first commit does not double-charge the budget.
-                        if (!flushDue) {
-                            return attempted;
-                        }
-                        // TransactionLogCursor treats txnLo as exclusive (lastApplied), so we
-                        // pass lastSeqTxn directly. The cursor's getTxn() returns entries with
-                        // seqTxn > lastSeqTxn.
-                        attempted = true;
-                        if (appliedBase) {
-                            // Read-only replica: the raw base WAL races its own async download/apply, so
-                            // always read the applied, post-apply base table. drainAppliedBase pins it
-                            // behind the cooperative apply-lag gate and routes any timestamp overlap
-                            // through o3Replay -- the replica owns and rewrites its own LV disk under
-                            // symmetric refresh. Deliberately bypasses the dedup isRangeProvablyClean
-                            // raw-WAL shortcut: a replica has no settled raw WAL to fast-path against.
-                            drainAppliedBase(instance, lastSeqTxn, seqTxn);
-                        } else if (dedupBase) {
-                            if (isRangeProvablyClean(instance.getDefinition().getBaseTableToken(), lastSeqTxn, seqTxn)) {
-                                // The applied base provably equals the raw WAL over this
-                                // range (nothing deduped / skipped / removed). Take the
-                                // proven raw-WAL path -- it appends additive same-ts rows without
-                                // the applied-reader over-trigger, and drainBaseWal's own O3
-                                // detection still routes a genuine below-frontier late row through
-                                // o3Replay over the applied base.
-                                incrementalRefresh(instance, lastSeqTxn, seqTxn, false);
-                                // Coupled invariant: keep refreshedUpTo == lastProcessed (which
-                                // incrementalRefresh, unlike drainAppliedBase, does not set) so a
-                                // later ALTER DEDUP DISABLE flip back to the lead path resumes
-                                // cleanly with no stale un-flushed lead / double emit. Uses
-                                // getLastProcessedSeqTxn() so a partial or internal-o3Replay cycle
-                                // stays consistent.
-                                instance.setRefreshedUpToSeqTxn(instance.getLastProcessedSeqTxn());
-                                // Coupled invariant: no un-flushed lead on the clean raw-WAL path.
-                                instance.setLeadRowCount(0);
-                                instance.bumpDedupRawWalCleanCycles();
-                            } else {
-                                // Cold signal, apply lag, or a divergence (dedup / skip / non-DATA
-                                // op) in range: read the applied, post-dedup base via a TableReader
-                                // and route any timestamp-overlap batch through o3Replay.
-                                drainAppliedBase(instance, lastSeqTxn, seqTxn);
-                            }
-                        } else {
-                            incrementalRefresh(instance, lastSeqTxn, seqTxn, false);
-                        }
-                        // Stamp the cadence with nowUs, the instant this cycle read the clock and
-                        // found the flush due, not with a fresh read taken after the drain. A
-                        // fresh read charges the cadence for the drain's own duration, so the interval
-                        // drifts by the work it schedules around. With a clock that jumps during the
-                        // drain and then stands still, a fresh read would also keep
-                        // nowUs - lastFlushUs at 0, and the view would never flush again.
-                        instance.setLastFlushTimeUs(nowUs);
-                    }
-                }
-                if (attempted) {
-                    instance.recordRefreshSuccess();
-                }
-            } catch (LiveViewApplyLagException e) {
-                // Apply lag defers without advancing durable output or spending the failure budget.
-                // The drain may already have fed rows into the accumulators before rolling back its
-                // WAL draft. Carry that state debt across turns so recovery rebuilds before those
-                // rows are fed again; a deferral before any row was fed owes no rebuild.
-                if (windowStateDirty) {
-                    markWindowStateDirty(instance);
-                }
-                armApplyLagDeferral(instance, e);
-                LOG.debug().$("live view refresh deferred, base apply lag [view=")
-                        .$(instance.getDefinition().getViewName())
-                        .$(", base=").$safe(e.getBaseTableName())
-                        .$(", advanceTo=").$(e.getTargetSeqTxn())
-                        .$(", appliedSeqTxn=").$(e.getAppliedSeqTxn()).I$();
-            } catch (Throwable t) {
-                invalidationReason = handleRefreshFailure(instance, t);
             }
         } finally {
             // Release the worker's staging buffer under the refresh latch (before unlockAfterRefresh),
@@ -18950,6 +18976,53 @@ public class LiveViewRefreshJob implements Job, QuietCloseable {
             engine.invalidateLiveView(instance, invalidationReason);
         }
         return attempted;
+    }
+
+    // Checks permission to start this refresh, not immediate invalidation on policy
+    // publication. A refresh approved against an earlier snapshot may still finish.
+    private String preflightExpiryPolicy(LiveViewInstance instance) {
+        final MetadataCache metadataCache = engine.getMetadataCache();
+        final long initialExpiryPolicyVersion = metadataCache.getExpiryPolicyVersion();
+
+        final LiveViewDefinition definition = instance.getDefinition();
+        final TableToken baseToken = engine.getTableTokenIfExists(definition.getBaseTableName());
+        if (baseToken == null) {
+            // DROP and RENAME of the base remove its name before they invalidate its live views, so a
+            // refresh can start in between. It defers and leaves the view to that invalidation. This call
+            // runs outside the refresh failure handling, so it has to return normally: the caller then
+            // acknowledges the base notification with notifyBaseRefreshed, which keeps event-driven refresh
+            // open for this base name.
+            return EXPIRY_PREFLIGHT_DEFERRED;
+        }
+        final MetadataCache.ExpiryPolicyInfo policy;
+        if (metadataCache.isExpiryPolicyUpdatePending(baseToken)) {
+            return EXPIRY_PREFLIGHT_DEFERRED;
+        }
+        try {
+            policy = metadataCache.lookupExpiryPolicy(baseToken);
+        } catch (CairoException e) {
+            if (metadataCache.isExpiryPolicyUpdatePending(baseToken)) {
+                return EXPIRY_PREFLIGHT_DEFERRED;
+            }
+            if (initialExpiryPolicyVersion != metadataCache.getExpiryPolicyVersion()) {
+                return EXPIRY_PREFLIGHT_DEFERRED;
+            }
+            throw e;
+        }
+        if (policy.isPending()) {
+            return EXPIRY_PREFLIGHT_DEFERRED;
+        }
+        if (initialExpiryPolicyVersion != metadataCache.getExpiryPolicyVersion()) {
+            return EXPIRY_PREFLIGHT_DEFERRED;
+        }
+        if (policy.getPredicate() != null) {
+            return Chars.toString(SqlException.materializationExpiryConflict(
+                    0,
+                    definition.getViewName(),
+                    baseToken.getTableName()
+            ).getFlyweightMessage());
+        }
+        return null;
     }
 
     /**

@@ -122,6 +122,8 @@ import io.questdb.cutlass.text.CopyExportContext;
 import io.questdb.cutlass.text.CopyImportContext;
 import io.questdb.griffin.CompiledQuery;
 import io.questdb.griffin.ExecutionState;
+import io.questdb.griffin.ExpiryPolicyVersionChangedException;
+import io.questdb.griffin.ExpiryReadPolicy;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.FunctionFactoryCache;
 import io.questdb.griffin.FunctionFactoryCacheBuilder;
@@ -1548,6 +1550,7 @@ public class CairoEngine implements Closeable, WriterSource {
      */
     public void completeInit() {
         initDataID();
+        saveLastRunVersion();
         settingsStore = new SettingsStore(configuration);
         tableIdGenerator.open();
         checkpointRecover();
@@ -1679,136 +1682,174 @@ public class CairoEngine implements Closeable, WriterSource {
         // the server default for a column that does not project a base SYMBOL
         // column. See LiveViewTableStructure.
         final BoolList outputSymbolCacheFlags = new BoolList();
-        try (SqlCompiler compiler = getSqlCompiler()) {
-            // Arm the shared non-determinism guard for the LV body, mirroring the
-            // mat-view compile (SqlCompilerImpl.compileCreateMatView). With it armed,
-            // FunctionParser rejects now()/sysdate()/systimestamp()/rnd_*/etc. anywhere
-            // in the SELECT - projection, WHERE filter, and window-function arguments -
-            // so the view can never produce non-reproducible results that diverge on a
-            // re-refresh, O3 replay, or checkpoint restore. The ANCHOR EXPRESSION is
-            // covered separately by validateAnchorPurity below.
-            final boolean ogAllowNonDeterministic = executionContext.allowNonDeterministicFunctions();
-            executionContext.setLiveViewCompile(true);
-            executionContext.setAllowNonDeterministicFunction(false);
-            CompiledQuery cq;
-            try {
-                cq = compiler.compile(op.getSelectSql(), executionContext);
-            } catch (SqlException e) {
-                // compile() reads the stored SELECT text alone: map its positions into the CREATE statement
-                e.setPosition(e.getPosition() + op.getSelectSqlPosition());
-                throw e;
-            } catch (ImplicitCastException e) {
-                throw e.position(e.getPosition() + op.getSelectSqlPosition());
-            } catch (CairoException e) {
-                // Only CairoException itself is created per throw and positioned in the SELECT text. Its
-                // subclasses carry no position of the text, and some are shared: PoolClosedException.INSTANCE
-                // and the fiber-local EntryLockedException / LimitOverflowException flyweights never reset
-                // their position, so writing one would leak into later throws.
-                if (e.getClass() == CairoException.class) {
-                    e.position(e.getPosition() + op.getSelectSqlPosition());
-                }
-                throw e;
-            } finally {
-                executionContext.setLiveViewCompile(false);
-                executionContext.setAllowNonDeterministicFunction(ogAllowNonDeterministic);
-            }
-            try (RecordCursorFactory factory = cq.getRecordCursorFactory()) {
-                final LiveViewCompiledPlan plan = validateLiveViewFactory(factory, baseTableToken, op.getViewNamePosition());
-                metadata = GenericRecordMetadata.copyOfNew(factory.getMetadata());
-                validateLiveViewTimestamp(metadata, baseTimestampName, op.getViewNamePosition());
-                validateLiveViewColumnTypes(metadata, op.getSelectColumnPositions());
-
-                // Resolved by the same helper the repair's uniqueness check reads, so the pair the
-                // table deduplicates on and the pair a repair proves unique always match.
-                if (configuration.isLiveViewCheckpointRepairSparsePublicationEnabled()) {
-                    sparsePublicationKeyColumnIndex =
-                            LiveViewCheckpointOutputUniqueness.outputKeyColumnIndex(plan);
-                }
-
-                // Capture each base-column name the SELECT projects. Resolving
-                // against the base table here also catches the rare case of an LV
-                // SELECT that names a column the base no longer has — better to fail
-                // CREATE early than to land an LV that's invalid on first refresh.
-                final RecordMetadata baseProjMeta = plan.getBaseScanMetadata();
-                try (MetadataCacheReader metaRO = getMetadataCache().readLock()) {
-                    final CairoTable baseTable = metaRO.getTable(baseTableToken);
-                    if (baseTable == null) {
-                        throw CairoException.tableDoesNotExist(baseTableToken.getTableName());
+        for (int retryCount = 0; ; retryCount++) {
+            final long initialExpiryPolicyVersion = metadataCache.getExpiryPolicyVersion();
+            dependencyColumnNames.clear();
+            dependencyColumnTypes.clear();
+            outputSymbolCacheFlags.clear();
+            try (SqlCompiler compiler = getSqlCompiler()) {
+                // Arm the shared non-determinism guard for the LV body, mirroring the
+                // mat-view compile (SqlCompilerImpl.compileCreateMatView). With it armed,
+                // FunctionParser rejects now()/sysdate()/systimestamp()/rnd_*/etc. anywhere
+                // in the SELECT - projection, WHERE filter, and window-function arguments -
+                // so the view can never produce non-reproducible results that diverge on a
+                // re-refresh, O3 replay, or checkpoint restore. The ANCHOR EXPRESSION is
+                // covered separately by validateAnchorPurity below.
+                final boolean ogAllowNonDeterministic = executionContext.allowNonDeterministicFunctions();
+                final ExpiryReadPolicy previousExpiryReadPolicy = executionContext.getExpiryReadPolicy();
+                final CharSequence previousMaterializingViewName = executionContext.getExpiryMaterializingViewName();
+                executionContext.setLiveViewCompile(true);
+                executionContext.setAllowNonDeterministicFunction(false);
+                executionContext.setExpiryReadPolicy(ExpiryReadPolicy.REJECT, op.getViewName());
+                CompiledQuery cq;
+                try {
+                    cq = compiler.compile(op.getSelectSql(), executionContext);
+                } catch (SqlException e) {
+                    // compile() reads the stored SELECT text alone: map its positions into the CREATE statement
+                    e.setPosition(e.getPosition() + op.getSelectSqlPosition());
+                    throw e;
+                } catch (ImplicitCastException e) {
+                    throw e.position(e.getPosition() + op.getSelectSqlPosition());
+                } catch (CairoException e) {
+                    // Only CairoException itself is created per throw and positioned in the SELECT text. Its
+                    // subclasses carry no position of the text, and some are shared: PoolClosedException.INSTANCE
+                    // and the fiber-local EntryLockedException / LimitOverflowException flyweights never reset
+                    // their position, so writing one would leak into later throws.
+                    if (e.getClass() == CairoException.class) {
+                        e.position(e.getPosition() + op.getSelectSqlPosition());
                     }
-                    for (int i = 0, n = baseProjMeta.getColumnCount(); i < n; i++) {
-                        CharSequence colName = baseProjMeta.getColumnName(i);
-                        final CairoColumn baseColumn = baseTable.getColumnQuiet(colName);
-                        if (baseColumn == null) {
-                            throw CairoException.critical(0)
-                                    .put("live view base column not found [view=").put(op.getViewName())
-                                    .put(", column=").put(colName).put(']');
+                    throw e;
+                } finally {
+                    executionContext.setLiveViewCompile(false);
+                    executionContext.setAllowNonDeterministicFunction(ogAllowNonDeterministic);
+                    executionContext.setExpiryReadPolicy(previousExpiryReadPolicy, previousMaterializingViewName);
+                }
+                try (RecordCursorFactory factory = cq.getRecordCursorFactory()) {
+                    final LiveViewCompiledPlan plan = validateLiveViewFactory(factory, baseTableToken, op.getViewNamePosition());
+                    metadata = GenericRecordMetadata.copyOfNew(factory.getMetadata());
+                    validateLiveViewTimestamp(metadata, baseTimestampName, op.getViewNamePosition());
+                    validateLiveViewColumnTypes(metadata, op.getSelectColumnPositions());
+
+                    // Resolved by the same helper the repair's uniqueness check reads, so the pair the
+                    // table deduplicates on and the pair a repair proves unique always match.
+                    if (configuration.isLiveViewCheckpointRepairSparsePublicationEnabled()) {
+                        sparsePublicationKeyColumnIndex =
+                                LiveViewCheckpointOutputUniqueness.outputKeyColumnIndex(plan);
+                    }
+
+                    // Capture each base-column name the SELECT projects. Resolving
+                    // against the base table here also catches the rare case of an LV
+                    // SELECT that names a column the base no longer has — better to fail
+                    // CREATE early than to land an LV that's invalid on first refresh.
+                    final RecordMetadata baseProjMeta = plan.getBaseScanMetadata();
+                    try (MetadataCacheReader metaRO = getMetadataCache().readLock()) {
+                        final CairoTable baseTable = metaRO.getTable(baseTableToken);
+                        if (baseTable == null) {
+                            throw CairoException.tableDoesNotExist(baseTableToken.getTableName());
                         }
-                        dependencyColumnNames.add(Chars.toString(colName));
-                        dependencyColumnTypes.add(baseColumn.getType());
-                    }
-
-                    // A SYMBOL column the view projects straight out of the base
-                    // inherits the base column's cache flag, so a base that asked
-                    // for NOCACHE does not get writer and reader caching turned
-                    // back on through its view. The projection does not carry
-                    // the flag
-                    // (SqlCodeGenerator mints a fresh TableColumnMetadata for a
-                    // SYMBOL output column), so resolve it here.
-                    //
-                    // Traced through the plan's nodes rather than matched by name:
-                    // a live view now admits an alias and a projection on either
-                    // side of the window, and `sym AS s` leaves an output column
-                    // whose name no base column carries. A name match answers "not
-                    // found" there and falls back to the server default, which is
-                    // the direction that turns caching back on for a base that
-                    // asked for NOCACHE. The trace follows the column functions and
-                    // the mapping's cross index instead, so it survives the rename.
-                    for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
-                        boolean isCached = configuration.getDefaultSymbolCacheFlag();
-                        if (ColumnType.isSymbol(metadata.getColumnType(i))) {
-                            final int scanIndex = plan.traceOutputColumnToBaseScan(i);
-                            final CairoColumn baseColumn = scanIndex < 0
-                                    ? null
-                                    : baseTable.getColumnQuiet(baseProjMeta.getColumnName(scanIndex));
-                            if (baseColumn != null && ColumnType.isSymbol(baseColumn.getType())) {
-                                isCached = baseColumn.isSymbolCached();
+                        for (int i = 0, n = baseProjMeta.getColumnCount(); i < n; i++) {
+                            CharSequence colName = baseProjMeta.getColumnName(i);
+                            final CairoColumn baseColumn = baseTable.getColumnQuiet(colName);
+                            if (baseColumn == null) {
+                                throw CairoException.critical(0)
+                                        .put("live view base column not found [view=").put(op.getViewName())
+                                        .put(", column=").put(colName).put(']');
                             }
+                            dependencyColumnNames.add(Chars.toString(colName));
+                            dependencyColumnTypes.add(baseColumn.getType());
                         }
-                        outputSymbolCacheFlags.add(isCached);
+
+                        // A SYMBOL column the view projects straight out of the base
+                        // inherits the base column's cache flag, so a base that asked
+                        // for NOCACHE does not get writer and reader caching turned
+                        // back on through its view. The projection does not carry
+                        // the flag
+                        // (SqlCodeGenerator mints a fresh TableColumnMetadata for a
+                        // SYMBOL output column), so resolve it here.
+                        //
+                        // Traced through the plan's nodes rather than matched by name:
+                        // a live view now admits an alias and a projection on either
+                        // side of the window, and `sym AS s` leaves an output column
+                        // whose name no base column carries. A name match answers "not
+                        // found" there and falls back to the server default, which is
+                        // the direction that turns caching back on for a base that
+                        // asked for NOCACHE. The trace follows the column functions and
+                        // the mapping's cross index instead, so it survives the rename.
+                        for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+                            boolean isCached = configuration.getDefaultSymbolCacheFlag();
+                            if (ColumnType.isSymbol(metadata.getColumnType(i))) {
+                                final int scanIndex = plan.traceOutputColumnToBaseScan(i);
+                                final CairoColumn baseColumn = scanIndex < 0
+                                        ? null
+                                        : baseTable.getColumnQuiet(baseProjMeta.getColumnName(scanIndex));
+                                if (baseColumn != null && ColumnType.isSymbol(baseColumn.getType())) {
+                                    isCached = baseColumn.isSymbolCached();
+                                }
+                            }
+                            outputSymbolCacheFlags.add(isCached);
+                        }
+                    }
+
+                    // Authorize reading the base columns the view projects. CREATE LIVE VIEW
+                    // never opens a cursor over the compiled factory - unlike CREATE
+                    // MATERIALIZED VIEW, which does and thereby triggers the cursor-open
+                    // authorizeSelect in AbstractPartitionFrameCursorFactory - so the write-side
+                    // authorizeLiveViewCreate would otherwise be the only check. A principal
+                    // holding live-view-create but no SELECT on the base could then read the
+                    // base's columns through the view it creates. dependencyColumnNames is the
+                    // base-scan read set (projection + filter columns), so this grants exactly
+                    // the per-column precision the cursor-open path applies to a plain SELECT.
+                    // Runs before the table is created, so a denial leaves nothing behind.
+                    final SecurityContext securityContext = executionContext.getSecurityContext();
+                    if (dependencyColumnNames.size() > 0) {
+                        // Widen to the authorizeSelect signature; CREATE is not a hot path.
+                        final ObjList<CharSequence> authorizeColumnNames = new ObjList<>(dependencyColumnNames.size());
+                        for (int i = 0, n = dependencyColumnNames.size(); i < n; i++) {
+                            authorizeColumnNames.add(dependencyColumnNames.getQuick(i));
+                        }
+                        securityContext.authorizeSelect(baseTableToken, authorizeColumnNames);
+                    } else {
+                        securityContext.authorizeSelectOnAnyColumn(baseTableToken);
+                    }
+
+                    // Pass 2 of the ANCHOR EXPRESSION validator. Pass 1 (AST-level rejects of subqueries,
+                    // bind variables, rnd_*/now()/etc.) ran in the parser; this is the
+                    // function-property half that needs the compiled tree so it can see
+                    // post-constant-fold flags and runtime-state predicates per-fn.
+                    // Runs at CREATE only, never at restart.
+                    final LiveViewDefinition.LvAnchorSpec anchor = op.getAnchorSpec();
+                    if (anchor != null && anchor.anchorExpressionSql != null) {
+                        validateAnchorExpression(compiler, anchor, baseProjMeta, executionContext);
                     }
                 }
-
-                // Authorize reading the base columns the view projects. CREATE LIVE VIEW
-                // never opens a cursor over the compiled factory - unlike CREATE
-                // MATERIALIZED VIEW, which does and thereby triggers the cursor-open
-                // authorizeSelect in AbstractPartitionFrameCursorFactory - so the write-side
-                // authorizeLiveViewCreate would otherwise be the only check. A principal
-                // holding live-view-create but no SELECT on the base could then read the
-                // base's columns through the view it creates. dependencyColumnNames is the
-                // base-scan read set (projection + filter columns), so this grants exactly
-                // the per-column precision the cursor-open path applies to a plain SELECT.
-                // Runs before the table is created, so a denial leaves nothing behind.
-                final SecurityContext securityContext = executionContext.getSecurityContext();
-                if (dependencyColumnNames.size() > 0) {
-                    // Widen to the authorizeSelect signature; CREATE is not a hot path.
-                    final ObjList<CharSequence> authorizeColumnNames = new ObjList<>(dependencyColumnNames.size());
-                    for (int i = 0, n = dependencyColumnNames.size(); i < n; i++) {
-                        authorizeColumnNames.add(dependencyColumnNames.getQuick(i));
+            } catch (TableReferenceOutOfDateException e) {
+                if (e instanceof ExpiryPolicyVersionChangedException) {
+                    if (retryCount == configuration.getMaxSqlRecompileAttempts()) {
+                        throw SqlException.position(0).put("too many row-expiry policy changes during live view compilation");
                     }
-                    securityContext.authorizeSelect(baseTableToken, authorizeColumnNames);
-                } else {
-                    securityContext.authorizeSelectOnAnyColumn(baseTableToken);
+                    continue;
                 }
-
-                // Pass 2 of the ANCHOR EXPRESSION validator. Pass 1 (AST-level rejects of subqueries,
-                // bind variables, rnd_*/now()/etc.) ran in the parser; this is the
-                // function-property half that needs the compiled tree so it can see
-                // post-constant-fold flags and runtime-state predicates per-fn.
-                // Runs at CREATE only, never at restart.
-                final LiveViewDefinition.LvAnchorSpec anchor = op.getAnchorSpec();
-                if (anchor != null && anchor.anchorExpressionSql != null) {
-                    validateAnchorExpression(compiler, anchor, baseProjMeta, executionContext);
+                if (initialExpiryPolicyVersion == metadataCache.getExpiryPolicyVersion()) {
+                    throw e;
                 }
+                if (retryCount == configuration.getMaxSqlRecompileAttempts()) {
+                    throw SqlException.position(0).put("too many row-expiry policy changes during live view compilation");
+                }
+                continue;
+            } catch (SqlException e) {
+                if (!e.isMaterializationExpiryConflict() || initialExpiryPolicyVersion == metadataCache.getExpiryPolicyVersion()) {
+                    throw e;
+                }
+                if (retryCount == configuration.getMaxSqlRecompileAttempts()) {
+                    throw SqlException.position(0).put("too many row-expiry policy changes during live view compilation");
+                }
+                continue;
+            }
+            if (initialExpiryPolicyVersion == metadataCache.getExpiryPolicyVersion()) {
+                break;
+            }
+            if (retryCount == configuration.getMaxSqlRecompileAttempts()) {
+                throw SqlException.position(0).put("too many row-expiry policy changes during live view compilation");
             }
         }
 
@@ -2396,6 +2437,11 @@ public class CairoEngine implements Closeable, WriterSource {
     }
 
     @TestOnly
+    public int getBusyWalWriterCount() {
+        return walWriterPool.getBusyCount();
+    }
+
+    @TestOnly
     public int getBusyWriterCount() {
         return writerPool.getBusyCount();
     }
@@ -2620,14 +2666,15 @@ public class CairoEngine implements Closeable, WriterSource {
      * Returns a pooled table reader that is pointed at the same transaction number
      * as the source reader.
      * <p>
-     * If the source reader is detached and not in use, returns the source reader.
+     * If the source reader is detached, not in use, and has no Delta rows, returns it.
      * The source reader must be used only through calling this method.
      */
     public TableReader getReaderAtTxn(TableReader srcReader, SqlExecutionContext executionContext) {
         assert srcReader.isOpen() && srcReader.isActive();
         // Fast path: go with the base reader if it's not in-use. It was borrowed before the
         // current query, so it is intentionally not attributed to the query's supervisor.
-        if (readerPool.isDetached(srcReader) && readerPool.getDetachedRefCount(srcReader) == 0) {
+        // Delta readers need pooled copies so cursor close frees checkpoints before tracker recycling.
+        if (readerPool.isDetached(srcReader) && readerPool.getDetachedRefCount(srcReader) == 0 && !srcReader.hasAnyDelta()) {
             readerPool.incDetachedRefCount(srcReader);
             return srcReader;
         }
@@ -3201,7 +3248,8 @@ public class CairoEngine implements Closeable, WriterSource {
                                 sequencerTxn,
                                 walTimestamp,
                                 minTimestamp == Long.MAX_VALUE ? Numbers.LONG_NULL : minTimestamp,
-                                maxTimestamp
+                                maxTimestamp,
+                                RecentWriteTracker.RowCountSource.of(txReader)
                         )) {
                             hydratedCount++;
                         }
@@ -3604,6 +3652,14 @@ public class CairoEngine implements Closeable, WriterSource {
         return false;
     }
 
+    /**
+     * Runs before a dropped WAL table's files are deleted, while its readers and writer are locked out.
+     * Returns false when background work must drain before a later purge attempt.
+     */
+    public boolean notifyDroppedTablePurge(TableToken tableToken) {
+        return true;
+    }
+
     public void notifyLiveViewBaseTableCommit(TableToken baseTableToken, long seqTxn) {
         liveViewStateStore.notifyBaseTableCommit(baseTableToken, seqTxn);
     }
@@ -3642,6 +3698,14 @@ public class CairoEngine implements Closeable, WriterSource {
     }
 
     /**
+     * Asks CheckWalTransactionsJob to rescan the WAL tables at its paced interval, leaving every transaction
+     * tracker as it is. A table whose initialised tracker lags its sequencer is notified again from that scan.
+     */
+    public void notifyWalTxnRepublisher() {
+        unpublishedWalTxnCount.incrementAndGet();
+    }
+
+    /**
      * This is a workaround for notification queue full and other off-piste events. It includes a hack to
      * prevent repeated notifications by uninitializing the writer's transaction tracker.
      *
@@ -3649,7 +3713,7 @@ public class CairoEngine implements Closeable, WriterSource {
      */
     public void notifyWalTxnRepublisher(TableToken tableToken) {
         tableSequencerAPI.updateWriterTxns(tableToken, SeqTxnTracker.UNINITIALIZED_TXN, SeqTxnTracker.UNINITIALIZED_TXN);
-        unpublishedWalTxnCount.incrementAndGet();
+        notifyWalTxnRepublisher();
     }
 
     /**
@@ -5359,6 +5423,13 @@ public class CairoEngine implements Closeable, WriterSource {
             // client REBASE WAL on a demoting primary is refused (the demote write-fence).
             oldWriter = replicaVariant ? getWriterUnsafe(oldToken, "rebase") : getWriter(oldToken, "rebase");
 
+            // Delta catalogs retain transaction numbers that a WAL rebase resets to zero.
+            if (oldWriter.getTxWriter().hasDeltaState()) {
+                throw CairoException.nonCritical()
+                        .put("cannot rebase WAL, table has a delta-active partition or delta data [table=")
+                        .put(tableName).put(']');
+            }
+
             try (Path src = new Path(); Path dst = new Path()) {
                 // Build the clone in a hidden ".rebase/" staging dir (mirrors ".download"/".checkpoint").
                 // Startup table-dir scans only consider immediate db-root children that are complete tables
@@ -5712,6 +5783,14 @@ public class CairoEngine implements Closeable, WriterSource {
         }
     }
 
+    // Records the release that starts on the database directory, before it changes anything there: see
+    // LastRunVersion. A read-only instance writes nothing to the directory.
+    private void saveLastRunVersion() {
+        if (!configuration.isReadOnlyInstance()) {
+            LastRunVersion.save(configuration, getOssVersion(), getEnterpriseVersion());
+        }
+    }
+
     private boolean tryLockWalPurgeJob0(long timeout, TimeUnit timeUnit) {
         if (timeout == 0) {
             return walPurgeJobLock.tryLock();
@@ -5891,8 +5970,27 @@ public class CairoEngine implements Closeable, WriterSource {
         isSqlExecutionCooperativePollingEnabled = true;
     }
 
+    /**
+     * The QuestDB Enterprise version this engine runs as, for {@link LastRunVersion}: {@code null} in OSS,
+     * which has none. {@link #completeInit()} may call it from the constructor, so an override must not read
+     * the fields of its own class.
+     */
+    protected @Nullable CharSequence getEnterpriseVersion() {
+        return null;
+    }
+
     protected Iterable<FunctionFactory> getFunctionFactories() {
         return new FunctionFactoryCacheBuilder().scan(LOG).build();
+    }
+
+    /**
+     * The QuestDB (OSS) version this engine runs as, for {@link LastRunVersion}. In OSS it is the version of
+     * the build; Enterprise, whose build information names the Enterprise release, overrides it.
+     * {@link #completeInit()} may call it from the constructor, so an override must not read the fields of
+     * its own class.
+     */
+    protected CharSequence getOssVersion() {
+        return configuration.getBuildInformation().getSwVersion();
     }
 
     protected void initDataID() {

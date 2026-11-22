@@ -165,6 +165,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
             lastSealedPartitionMaxTimestamp = prevLastSealedPartitionMaxTimestamp;
             fixedRowCount -= prevTransientRowCount;
             transientRowCount = prevTransientRowCount + 1; // When row cancel finishes 1 is subtracted. Add 1 to compensate.
+            partitionDeltaCount -= getPartitionHasDelta(getPartitionCount() - 1) ? 1 : 0;
+            partitionDeltaActiveCount -= isPartitionDeltaActive(getPartitionCount() - 1) ? 1 : 0;
             attachedPartitions.setPos(attachedPartitions.size() - LONGS_PER_TX_ATTACHED_PARTITION);
             prevTransientRowCount = getLong(TX_OFFSET_TRANSIENT_ROW_COUNT_64);
         }
@@ -209,6 +211,41 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
             prevRecordBaseOffset = -2;
             lastSealedPartitionMaxTimestamp = Long.MIN_VALUE;
             prevLastSealedPartitionMaxTimestamp = Long.MIN_VALUE;
+        }
+    }
+
+    /**
+     * Clears a partition's REMOTE, and its seal stamp when {@code isSealStampCleared}, in place in the
+     * current record, with no commit, as {@link #resetLagAppliedRows()} resets the lag. Snapshot restore
+     * only, before any writer opens.
+     */
+    public void clearPartitionStampFlagsUnsafe(int partitionIndex, boolean isSealStampCleared) {
+        if (!(isSealStampCleared && isPartitionSealStamped(partitionIndex)) && !isPartitionRemote(partitionIndex)) {
+            return;
+        }
+        final long flags = isSealStampCleared ? PARTITION_SEAL_STAMP_BIT | PARTITION_REMOTE_BIT : PARTITION_REMOTE_BIT;
+        final int indexRaw = partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_VERSION_OFFSET;
+        final long oldWord = attachedPartitions.getQuick(indexRaw);
+        final long word = oldWord & ~flags;
+        final long partitionTableStart = getPartitionTableSizeOffset(symbolColumnCount);
+        final long offset = getPartitionTableIndexOffset(partitionTableStart, indexRaw);
+        attachedPartitions.setQuick(indexRaw, word);
+        txMemBase.putLong(readBaseOffset + offset, word);
+        // Unlike the lag and structure resets, this write lands in the body checksum's partition table. The flags
+        // sit in the word's high int: fold it into a cached hash of this record, then checksum the record again.
+        // A record without a checksum stamp stays without one, so it still loads as a released record.
+        final PartitionTableHash partitionTableHash = (baseVersion & 1) == 0 ? partitionTableHashA : partitionTableHashB;
+        if (partitionTableHash.isFor(readBaseOffset, readRecordSize, partitionTableStart)) {
+            foldPartitionTableInt(
+                    partitionTableHash,
+                    attachedPartitions.size(),
+                    offset - partitionTableStart + Integer.BYTES,
+                    (int) (oldWord >>> 32),
+                    (int) (word >>> 32)
+            );
+        }
+        if (isLoadedRecordChecksumVerified()) {
+            storeBodyChecksum(readBaseOffset, calculateBodyChecksum(readBaseOffset, readRecordSize, partitionTableStart, partitionTableHash));
         }
     }
 
@@ -288,6 +325,67 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
     }
 
     /**
+     * Commits only a swap of committed entries {@code [lo, committedHi)} for in-memory {@code [lo, lo + count)}; the
+     * open transaction's state stays uncommitted. Every other in-memory entry must equal its committed one.
+     */
+    public void commitPartitionRange(int commitMode, int lo, int committedHi, int count) {
+        final int symbolCount = txMemBase.getInt(readBaseOffset + TX_OFFSET_MAP_WRITER_COUNT_32);
+        final long partitionTableOffset = getPartitionTableSizeOffset(symbolCount);
+        final int committedPartitionLongs = txMemBase.getInt(readBaseOffset + partitionTableOffset) / Long.BYTES;
+        final int symbolBytes = symbolCount * Long.BYTES;
+        final int rawLo = lo * LONGS_PER_TX_ATTACHED_PARTITION;
+        final int rawCommittedHi = committedHi * LONGS_PER_TX_ATTACHED_PARTITION;
+        final int rawCount = count * LONGS_PER_TX_ATTACHED_PARTITION;
+        assert lo <= committedHi && rawCommittedHi <= committedPartitionLongs;
+        assert rawLo + rawCount <= attachedPartitions.size();
+        final int partitionLongs = committedPartitionLongs - (rawCommittedHi - rawLo) + rawCount;
+        final int partitionTableBytes = partitionLongs * Long.BYTES;
+
+        final long committedSeqTxn = getLong(TX_OFFSET_SEQ_TXN_64);
+        final int committedLagRowCount = txMemBase.getInt(readBaseOffset + TX_OFFSET_LAG_ROW_COUNT_32);
+        final long committedLagMinTimestamp = getLong(TX_OFFSET_LAG_MIN_TIMESTAMP_64);
+        final long committedLagMaxTimestamp = getLong(TX_OFFSET_LAG_MAX_TIMESTAMP_64);
+        final int committedLagTxnCount = Math.abs(txMemBase.getInt(readBaseOffset + TX_OFFSET_LAG_TXN_COUNT_32));
+
+        writeAreaSize = calculateTxRecordSize(symbolBytes, partitionTableBytes);
+        writeBaseOffset = calculateWriteOffset(writeAreaSize);
+        // The slot's cached partition-table hash stops describing its area as soon as the body write starts.
+        partitionTableHashOfNextSlot().invalidate();
+        final long partitionsOffset = getPartitionTableIndexOffset(partitionTableOffset, 0);
+        for (long offset = 0; offset < partitionsOffset; offset += Long.BYTES) {
+            putLong(offset, txMemBase.getLong(readBaseOffset + offset));
+        }
+        int dst = 0;
+        for (int i = 0; i < rawLo; i++) {
+            putLong(getPartitionTableIndexOffset(partitionTableOffset, dst++), committedPartitionLong(partitionTableOffset, i));
+        }
+        for (int i = 0; i < rawCount; i++) {
+            putLong(getPartitionTableIndexOffset(partitionTableOffset, dst++), attachedPartitions.getQuick(rawLo + i));
+        }
+        for (int i = rawCommittedHi; i < committedPartitionLongs; i++) {
+            putLong(getPartitionTableIndexOffset(partitionTableOffset, dst++), committedPartitionLong(partitionTableOffset, i));
+        }
+        assert dst == partitionLongs;
+        putInt(partitionTableOffset, partitionTableBytes);
+        putLong(TX_OFFSET_TXN_64, ++txn);
+        putLong(TX_OFFSET_PARTITION_TABLE_VERSION_64, partitionTableVersion);
+        putLong(TX_OFFSET_COLUMN_VERSION_64, columnVersion);
+        putInt(TX_OFFSET_GEOMETRY_VERSION_32, geometryVersion);
+        putInt(
+                TX_OFFSET_CHECKSUM_32,
+                calculateTxnLagChecksum(txn, committedSeqTxn, committedLagRowCount, committedLagMinTimestamp, committedLagMaxTimestamp, committedLagTxnCount)
+        );
+        finishABHeader(writeBaseOffset, symbolBytes, partitionTableBytes, commitMode);
+
+        // Keep the next commit off the in-place fast path: the record before last holds the old entries.
+        prevRecordStructureVersion = -2L;
+        lastRecordStructureVersion = -1L;
+        prevRecordBaseOffset = lastRecordBaseOffset;
+        lastRecordBaseOffset = writeBaseOffset;
+        prevPartitionTableVersion = partitionTableVersion;
+    }
+
+    /**
      * Makes the {@code _txn} file durable whatever the commit mode: msync(MS_SYNC) of the mapping, then an
      * fsync of the fd. A save point ({@link TableWriter#fsyncMaterializedState()}) calls it after the column
      * data and {@code _cv} are durable, so the pointer never lands before the data. Under NOSYNC and ADAPTIVE
@@ -331,6 +429,15 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
 
     public int getAppendedPartitionCount() {
         return txPartitionCount;
+    }
+
+    /**
+     * Partitions in the committed record; an open transaction may hold more in memory.
+     */
+    public int getCommittedPartitionCount() {
+        final int symbolCount = txMemBase.getInt(readBaseOffset + TX_OFFSET_MAP_WRITER_COUNT_32);
+        final int partitionTableBytes = txMemBase.getInt(readBaseOffset + getPartitionTableSizeOffset(symbolCount));
+        return partitionTableBytes / (LONGS_PER_TX_ATTACHED_PARTITION * Long.BYTES);
     }
 
     public long getLastTxSize() {
@@ -395,6 +502,32 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
             return getPartitionFloor(prevPartitionTs) == getPartitionFloor(timestamp);
         }
         return false;
+    }
+
+    /**
+     * Whether the committed record holds this partition's in-memory entry unchanged.
+     */
+    public boolean isPartitionEntryCommitted(int partitionIndex) {
+        if (partitionIndex < 0 || partitionIndex >= getCommittedPartitionCount()) {
+            return false;
+        }
+        final int symbolCount = txMemBase.getInt(readBaseOffset + TX_OFFSET_MAP_WRITER_COUNT_32);
+        final long partitionTableOffset = getPartitionTableSizeOffset(symbolCount);
+        final int rawIndex = partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION;
+        for (int i = 0; i < LONGS_PER_TX_ATTACHED_PARTITION; i++) {
+            final long committed = txMemBase.getLong(readBaseOffset + getPartitionTableIndexOffset(partitionTableOffset, rawIndex + i));
+            if (committed != attachedPartitions.getQuick(rawIndex + i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether the open transaction changed the partition table in a way only a whole commit can publish.
+     */
+    public boolean isPartitionTableChanged() {
+        return prevPartitionTableVersion != partitionTableVersion;
     }
 
     /**
@@ -474,6 +607,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         transientRowCount = 0;
         fixedRowCount = 0;
         attachedPartitions.clear();
+        partitionDeltaCount = 0;
+        partitionDeltaActiveCount = 0;
         recordStructureVersion++;
         truncateVersion++;
         partitionTableVersion++;
@@ -487,6 +622,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         if (indexRaw > -1) {
             final int size = attachedPartitions.size();
             final int lim = size - LONGS_PER_TX_ATTACHED_PARTITION;
+            partitionDeltaCount -= getPartitionHasDeltaByRawIndex(indexRaw) ? 1 : 0;
+            partitionDeltaActiveCount -= isPartitionDeltaActiveByRawIndex(indexRaw) ? 1 : 0;
             if (indexRaw < lim) {
                 attachedPartitions.arrayCopy(indexRaw + LONGS_PER_TX_ATTACHED_PARTITION, indexRaw, lim - indexRaw);
             }
@@ -659,6 +796,51 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
     }
 
     /**
+     * Sets the delta-write bit, preserving REMOTE, VALID and the offset-3 value. Set-only: the bit
+     * is the replicated delta-mode gate and is never cleared in place -- DROP PARTITION removes the
+     * whole record.
+     */
+    public void setPartitionDeltaActiveByRawIndex(int indexRaw) {
+        if (indexRaw < 0) {
+            throw CairoException.nonCritical().put("bad partition index -1");
+        }
+        if (!isPartitionDeltaActiveByRawIndex(indexRaw)) {
+            partitionDeltaActiveCount++;
+        }
+        attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, getPartitionOffset3(indexRaw) | PARTITION_DELTA_WRITE_BIT);
+    }
+
+    public void setPartitionDeltaActiveByTimestamp(long timestamp) {
+        setPartitionDeltaActiveByRawIndex(findAttachedPartitionRawIndex(timestamp));
+    }
+
+    public void setPartitionHasDelta(int partitionIndex, boolean hasDelta) {
+        setPartitionHasDeltaByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, hasDelta);
+    }
+
+    public void setPartitionHasDeltaByRawIndex(int indexRaw, boolean hasDelta) {
+        if (indexRaw < 0) {
+            throw CairoException.nonCritical().put("bad partition index -1");
+        }
+        final int offset = indexRaw + PARTITION_VERSION_OFFSET;
+        final long raw = attachedPartitions.getQuick(offset);
+        if (raw == -1L) {
+            // The legacy cleared word carries no flag bits.
+            throw CairoException.nonCritical().put("cannot set HAS_DELTA on partition with a cleared offset-3 word");
+        }
+        // Keyed on delta mode, not base format: a delta-active base may be native (offset-3
+        // holds its seqTxn word) or parquet. A partition outside delta mode has no business
+        // setting the catalog bit.
+        if (hasDelta && (raw & PARTITION_DELTA_WRITE_BIT) == 0) {
+            throw CairoException.nonCritical().put("cannot set HAS_DELTA on partition without delta-write mode");
+        }
+        if (getPartitionHasDeltaByRawIndex(indexRaw) != hasDelta) {
+            partitionDeltaCount += hasDelta ? 1 : -1;
+        }
+        attachedPartitions.setQuick(offset, hasDelta ? raw | PARTITION_HAS_DELTA_BIT : raw & ~PARTITION_HAS_DELTA_BIT);
+    }
+
+    /**
      * Publishes a partition's geometry pointer into its {@code _txn} record - the offset-3 word, whose VALUE field a
      * composite NATIVE partition spends on the pointer instead of on a seqTxn stamp.
      */
@@ -776,14 +958,28 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         setPartitionRemoteByRawIndex(findAttachedPartitionRawIndex(timestamp), isRemote);
     }
 
+    /**
+     * Marks the partition's current stamp as one a PARTITION_SEAL wrote, or clears the mark. The
+     * next seqTxn stamp or flip to native clears it too.
+     */
+    public void setPartitionSealStamped(int partitionIndex, boolean isSealStamped) {
+        final int indexRaw = partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION;
+        assert !isSealStamped || !isPartitionCompositeByRawIndex(indexRaw) : "a composite partition records no stamp";
+        final long word = getPartitionOffset3(indexRaw);
+        attachedPartitions.setQuick(
+                indexRaw + PARTITION_VERSION_OFFSET,
+                isSealStamped ? word | PARTITION_SEAL_STAMP_BIT : word & ~PARTITION_SEAL_STAMP_BIT
+        );
+    }
+
     public boolean setPartitionSeqTxn(int partitionIndex, long seqTxn) {
         return setPartitionSeqTxnByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, seqTxn);
     }
 
     /**
      * Stamps a native partition's last-modifying seqTxn into the offset-3 word, preserving
-     * reserved flag bits. Clears REMOTE and parquet_generated: the stamp records a data
-     * change, so no remote or generated copy matches the bytes anymore. A positive stamp
+     * reserved flag bits. Clears REMOTE, the seal stamp and parquet_generated: the stamp records a
+     * data change, so no remote or generated copy matches the bytes anymore. A positive stamp
      * carries {@link TxReader#PARTITION_SEQ_TXN_VALID_BIT}, marking the word a trusted seqTxn
      * (untrusted legacy words read as -1). The non-WAL path stamps 0, the cleared word, which
      * reads back as the -1 "no version" sentinel.
@@ -800,7 +996,7 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
         setPartitionParquetGeneratedByRawIndex(indexRaw, false);
         long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK
-                & ~(PARTITION_REMOTE_BIT | PARTITION_SEQ_TXN_VALID_BIT);
+                & ~(PARTITION_REMOTE_BIT | PARTITION_SEQ_TXN_VALID_BIT | PARTITION_SEAL_STAMP_BIT);
         final long valid = seqTxn > 0 ? PARTITION_SEQ_TXN_VALID_BIT : 0L;
         attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (seqTxn & PARTITION_VERSION_VALUE_MASK) | flags | valid);
         return true;
@@ -903,6 +1099,13 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
     }
 
     public void updatePartitionSizeAndTxnByRawIndex(int index, long partitionSize) {
+        if (isPartitionDeltaActiveByRawIndex(index)) {
+            // The Delta state lives in this partition version and freezes its base.
+            throw CairoException.critical(0)
+                    .put("cannot write a new version of a delta-active partition [partition=")
+                    .ts(ColumnType.getTimestampDriver(timestampType), attachedPartitions.getQuick(index + PARTITION_TS_OFFSET))
+                    .put(']');
+        }
         recordStructureVersion++;
         markPartitionDirtyByRawIndex(index);
         updatePartitionSizeByRawIndex(index, partitionSize);
@@ -980,6 +1183,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         // If by any action data is reset and table is partitioned, clear attachedPartitions
         if (maxTimestamp == Long.MIN_VALUE && PartitionBy.isPartitioned(partitionBy)) {
             attachedPartitions.clear();
+            partitionDeltaCount = 0;
+            partitionDeltaActiveCount = 0;
         }
         return calculateTxRecordSize(symbolColumnCount * Long.BYTES, attachedPartitions.size() * Long.BYTES);
     }
@@ -1029,6 +1234,10 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         prevRecordBaseOffset = lastRecordBaseOffset;
         lastRecordBaseOffset = writeBaseOffset;
         prevPartitionTableVersion = partitionTableVersion;
+    }
+
+    private long committedPartitionLong(long partitionTableOffset, int rawIndex) {
+        return txMemBase.getLong(readBaseOffset + getPartitionTableIndexOffset(partitionTableOffset, rawIndex));
     }
 
     private void finishABHeader(int areaOffset, int bytesSymbols, int bytesPartitions, int commitMode) {
@@ -1227,8 +1436,12 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         // about to take is its file size, not a geometry pointer.
         long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK
                 & ~(PARTITION_SEQ_TXN_VALID_BIT | PARTITION_COMPOSITE_FLAG);
-        if (!isParquetFormat && version > 0) {
-            flags |= PARTITION_SEQ_TXN_VALID_BIT;
+        if (!isParquetFormat) {
+            // A flip to native stamps a new seqTxn, which no seal wrote.
+            flags &= ~PARTITION_SEAL_STAMP_BIT;
+            if (version > 0) {
+                flags |= PARTITION_SEQ_TXN_VALID_BIT;
+            }
         }
         attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (version & PARTITION_VERSION_VALUE_MASK) | flags);
     }
@@ -1337,6 +1550,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
                 long rowCount = 0;
                 for (int i = maxTimestampPartitionIndex, n = getPartitionCount() - 1; i < n; i++) {
                     rowCount += getPartitionSize(i);
+                    partitionDeltaCount -= getPartitionHasDelta(i + 1) ? 1 : 0;
+                    partitionDeltaActiveCount -= isPartitionDeltaActive(i + 1) ? 1 : 0;
                 }
                 attachedPartitions.setPos((maxTimestampPartitionIndex + 1) * LONGS_PER_TX_ATTACHED_PARTITION);
                 recordStructureVersion++;

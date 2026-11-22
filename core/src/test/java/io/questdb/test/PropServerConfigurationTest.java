@@ -215,6 +215,8 @@ public class PropServerConfigurationTest {
         // exercise.
         Assert.assertEquals(CommitMode.NOSYNC, configuration.getCairoConfiguration().getCommitMode());
         Assert.assertEquals(CommitMode.DEFAULT, configuration.getCairoConfiguration().getCommitMode());
+        // Out of the box every table is locked against older releases; the way down is opt-in.
+        Assert.assertFalse(configuration.getCairoConfiguration().isCommitModeAdaptiveDowngrade());
         // RPO of the adaptive group commit out of the box.
         Assert.assertEquals(50_000L, configuration.getCairoConfiguration().getAdaptiveCommitGroupWindowUs());
         Assert.assertEquals(2097152, configuration.getCairoConfiguration().getSqlCopyBufferSize());
@@ -222,6 +224,9 @@ public class PropServerConfigurationTest {
         Assert.assertEquals(5, configuration.getCairoConfiguration().getCreateAsSelectRetryCount());
         Assert.assertEquals(8, configuration.getCairoConfiguration().getViewLexerPoolCapacity());
         Assert.assertTrue(configuration.getCairoConfiguration().isMatViewEnabled());
+        Assert.assertTrue(configuration.getCairoConfiguration().isMatViewRowExpiryCleanupEnabled());
+        Assert.assertEquals(16_384, configuration.getCairoConfiguration().getMatViewRowExpiryCleanupMaxCachedPartitions());
+        Assert.assertEquals(0.5, configuration.getCairoConfiguration().getMatViewRowExpiryCleanupMinExpiredFraction(), 0.000001);
         Assert.assertFalse(configuration.getCairoConfiguration().isMatViewCoveringIndexEnabled());
         Assert.assertEquals(10, configuration.getCairoConfiguration().getMatViewMaxRefreshRetries());
         Assert.assertEquals(1_000_000, configuration.getCairoConfiguration().getMatViewInsertAsSelectBatchSize());
@@ -262,6 +267,7 @@ public class PropServerConfigurationTest {
         Assert.assertEquals(32, configuration.getCairoConfiguration().getSqlUnorderedMapMaxEntrySize());
         Assert.assertEquals(1024, configuration.getCairoConfiguration().getSqlModelPoolCapacity());
         Assert.assertEquals(10_000, configuration.getCairoConfiguration().getSqlMaxNegativeLimit());
+        Assert.assertEquals(4096, configuration.getCairoConfiguration().getSqlMaxGroupingSets());
         Assert.assertEquals(128 * 1024, configuration.getCairoConfiguration().getSqlSortKeyPageSize());
         Assert.assertEquals(Long.MAX_VALUE, configuration.getCairoConfiguration().getSqlSortKeyMaxBytes());
         Assert.assertEquals(128 * 1024, configuration.getCairoConfiguration().getSqlSortLightValuePageSize());
@@ -593,6 +599,54 @@ public class PropServerConfigurationTest {
         properties.setProperty("line.tcp.commit.interval.default", "1000");
         configuration = newPropServerConfiguration(properties);
         Assert.assertEquals(1000, configuration.getLineTcpReceiverConfiguration().getCommitIntervalDefault());
+    }
+
+    @Test
+    public void testCommitModeAdaptiveDowngrade() throws Exception {
+        // NOSYNC takes the downgrade setting: named, in upper case, or as the default mode.
+        for (String mode : new String[]{null, "nosync", "NOSYNC"}) {
+            final Properties properties = new Properties();
+            if (mode != null) {
+                properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE.getPropertyPath(), mode);
+            }
+            Assert.assertFalse(mode, newPropServerConfiguration(properties).getCairoConfiguration().isCommitModeAdaptiveDowngrade());
+            properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE_ADAPTIVE_DOWNGRADE.getPropertyPath(), "false");
+            Assert.assertFalse(mode, newPropServerConfiguration(properties).getCairoConfiguration().isCommitModeAdaptiveDowngrade());
+            properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE_ADAPTIVE_DOWNGRADE.getPropertyPath(), "true");
+            final CairoConfiguration configuration = newPropServerConfiguration(properties).getCairoConfiguration();
+            Assert.assertTrue(mode, configuration.isCommitModeAdaptiveDowngrade());
+            Assert.assertEquals(mode, CommitMode.NOSYNC, configuration.getCommitMode());
+        }
+
+        // The setting off, every other mode starts as before.
+        for (String mode : new String[]{"async", "sync", "adaptive"}) {
+            final Properties properties = new Properties();
+            properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE.getPropertyPath(), mode);
+            properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE_ADAPTIVE_DOWNGRADE.getPropertyPath(), "false");
+            final CairoConfiguration configuration = newPropServerConfiguration(properties).getCairoConfiguration();
+            Assert.assertEquals(mode, CommitMode.fromString(mode), configuration.getCommitMode());
+            Assert.assertFalse(mode, configuration.isCommitModeAdaptiveDowngrade());
+        }
+    }
+
+    @Test
+    public void testCommitModeAdaptiveDowngradeRefusedOutsideNosync() throws Exception {
+        // The start that unlocks the tables for an older release runs NOSYNC only: the server must not start
+        // with the setting in any other mode.
+        for (String mode : new String[]{"async", "sync", "adaptive", "ADAPTIVE"}) {
+            final Properties properties = new Properties();
+            properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE.getPropertyPath(), mode);
+            properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE_ADAPTIVE_DOWNGRADE.getPropertyPath(), "true");
+            try {
+                newPropServerConfiguration(properties);
+                Assert.fail("the downgrade setting must not start under " + mode);
+            } catch (ServerConfigurationException expected) {
+                Assert.assertEquals(
+                        "cairo.commit.mode.adaptive.downgrade=true requires cairo.commit.mode=nosync [mode=" + mode.toLowerCase() + ']',
+                        expected.getMessage()
+                );
+            }
+        }
     }
 
     @Test
@@ -1646,6 +1700,36 @@ public class PropServerConfigurationTest {
         newPropServerConfiguration(properties);
     }
 
+    @Test
+    public void testInvalidBoolean() throws Exception {
+        final Properties properties = new Properties();
+        properties.setProperty("pg.enabled", "tru");
+        // Without strict validation a malformed boolean reads as false.
+        Assert.assertFalse(newPropServerConfiguration(properties).getPGWireConfiguration().isEnabled());
+
+        properties.setProperty("config.validation.strict", "true");
+        properties.setProperty("pg.enabled", "FALSE");
+        Assert.assertFalse(newPropServerConfiguration(properties).getPGWireConfiguration().isEnabled());
+        properties.setProperty("pg.enabled", "True");
+        Assert.assertTrue(newPropServerConfiguration(properties).getPGWireConfiguration().isEnabled());
+
+        properties.setProperty("pg.enabled", "tru");
+        TestUtils.assertContains(
+                Assert.assertThrows(ServerConfigurationException.class, () -> newPropServerConfiguration(properties)).getMessage(),
+                "invalid configuration value [key=pg.enabled, value=tru, expected true or false]"
+        );
+
+        // An environment override is checked the same way.
+        properties.setProperty("pg.enabled", "true");
+        final Map<String, String> env = new HashMap<>();
+        env.put("QDB_PG_ENABLED", "1");
+        TestUtils.assertContains(
+                Assert.assertThrows(ServerConfigurationException.class,
+                        () -> newPropServerConfiguration(root, properties, env, new BuildInformationHolder())).getMessage(),
+                "invalid configuration value [key=pg.enabled, value=1, expected true or false]"
+        );
+    }
+
     @Test(expected = ServerConfigurationException.class)
     public void testInvalidConfigKeys() throws Exception {
         try (InputStream inputStream = PropServerConfigurationTest.class.getResourceAsStream("/server.conf")) {
@@ -1917,6 +2001,42 @@ public class PropServerConfigurationTest {
         properties.setProperty("line.udp.timestamp", "h");
         configuration = newPropServerConfiguration(properties);
         Assert.assertEquals(CommonUtils.TIMESTAMP_UNIT_HOURS, configuration.getLineUdpReceiverConfiguration().getTimestampUnit());
+    }
+
+    @Test
+    public void testMatViewRowExpiryCleanupMaxCachedPartitionsAcceptsZero() throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty(PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MAX_CACHED_PARTITIONS.getPropertyPath(), "0");
+        PropServerConfiguration configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(0, configuration.getCairoConfiguration().getMatViewRowExpiryCleanupMaxCachedPartitions());
+    }
+
+    @Test
+    public void testMatViewRowExpiryCleanupMaxCachedPartitionsRejectsNegative() throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty(PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MAX_CACHED_PARTITIONS.getPropertyPath(), "-1");
+        assertInvalidConfiguration(properties, PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MAX_CACHED_PARTITIONS);
+    }
+
+    @Test
+    public void testMatViewRowExpiryCleanupMinExpiredFractionRejectsAboveOne() throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty(PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MIN_EXPIRED_FRACTION.getPropertyPath(), "1.1");
+        assertInvalidConfiguration(properties, PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MIN_EXPIRED_FRACTION);
+    }
+
+    @Test
+    public void testMatViewRowExpiryCleanupMinExpiredFractionRejectsNaN() throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty(PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MIN_EXPIRED_FRACTION.getPropertyPath(), "NaN");
+        assertInvalidConfiguration(properties, PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MIN_EXPIRED_FRACTION);
+    }
+
+    @Test
+    public void testMatViewRowExpiryCleanupMinExpiredFractionRejectsNegative() throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty(PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MIN_EXPIRED_FRACTION.getPropertyPath(), "-0.1");
+        assertInvalidConfiguration(properties, PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_MIN_EXPIRED_FRACTION);
     }
 
     @Test
@@ -2371,6 +2491,30 @@ public class PropServerConfigurationTest {
     }
 
     @Test
+    public void testQwpMinIdleMsBeforeWriterRelease() throws Exception {
+        Properties properties = new Properties();
+        PropServerConfiguration configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(
+                30_000,
+                configuration.getHttpServerConfiguration().getLineHttpProcessorConfiguration().getQwpMinIdleMsBeforeWriterRelease()
+        );
+
+        properties.setProperty(PropertyKey.QWP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE.getPropertyPath(), "5s");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(
+                5_000,
+                configuration.getHttpServerConfiguration().getLineHttpProcessorConfiguration().getQwpMinIdleMsBeforeWriterRelease()
+        );
+
+        properties.setProperty(PropertyKey.QWP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE.getPropertyPath(), "0");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(
+                0,
+                configuration.getHttpServerConfiguration().getLineHttpProcessorConfiguration().getQwpMinIdleMsBeforeWriterRelease()
+        );
+    }
+
+    @Test
     public void testMemoryUsageLogConfiguration() throws Exception {
         Properties properties = new Properties();
         properties.setProperty(PropertyKey.MEMORY_USAGE_LOG_ENABLED.getPropertyPath(), "false");
@@ -2797,6 +2941,9 @@ public class PropServerConfigurationTest {
             Assert.assertTrue(configuration.getMetrics().isScrapeEnabled());
 
             Assert.assertFalse(configuration.getCairoConfiguration().isMatViewEnabled());
+            Assert.assertFalse(configuration.getCairoConfiguration().isMatViewRowExpiryCleanupEnabled());
+            Assert.assertEquals(1000, configuration.getCairoConfiguration().getMatViewRowExpiryCleanupMaxCachedPartitions());
+            Assert.assertEquals(0.25, configuration.getCairoConfiguration().getMatViewRowExpiryCleanupMinExpiredFraction(), 0.000001);
             Assert.assertEquals(100, configuration.getCairoConfiguration().getMatViewMaxRefreshRetries());
             Assert.assertEquals(1000, configuration.getCairoConfiguration().getMatViewInsertAsSelectBatchSize());
             Assert.assertEquals(10000, configuration.getCairoConfiguration().getMatViewRowsPerQueryEstimate());
@@ -3747,6 +3894,7 @@ public class PropServerConfigurationTest {
         Assert.assertFalse(configuration.isCheckpointRecoveryEnabled());
 
         Assert.assertEquals(CommitMode.ASYNC, configuration.getCommitMode());
+        Assert.assertFalse(configuration.isCommitModeAdaptiveDowngrade());
         // Adaptive settings, checked here so the CairoConfigurationWrapper arm proves the wrapper delegates
         // them: every one of these is a default method on CairoConfiguration, so a missed delegation compiles.
         Assert.assertEquals(12345, configuration.getAdaptiveEpochIntervalMs());
@@ -4003,7 +4151,8 @@ public class PropServerConfigurationTest {
                     if (!key.contains(".") || key.startsWith("http.redirect") || key.contains(" ")
                             || key.startsWith("replication") || key.startsWith("acl") || key.contains("tls")
                             || key.startsWith("cold.storage") || key.startsWith("native.")
-                            || key.startsWith("backup.") || key.startsWith("checkpoint.history.")) { // Enterprise confs
+                            || key.startsWith("backup.") || key.startsWith("checkpoint.history.")
+                            || key.startsWith("storage.policy.")) { // Enterprise confs
                         continue;
                     }
                     properties.clear();

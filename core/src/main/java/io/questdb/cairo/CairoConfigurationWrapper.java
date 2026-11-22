@@ -31,6 +31,8 @@ import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
 import io.questdb.TelemetryConfiguration;
 import io.questdb.VolumeDefinitions;
+import io.questdb.cairo.sql.PartitionFrameDecoder;
+import io.questdb.cairo.sql.PartitionFrameStateFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
 import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
 import io.questdb.cutlass.text.TextConfiguration;
@@ -44,11 +46,13 @@ import io.questdb.std.datetime.MicrosecondClock;
 import io.questdb.std.datetime.TimeZoneRules;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.str.CharSink;
+import io.questdb.tasks.ColumnPurgeTask;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import java.util.function.ObjIntConsumer;
 
 public class CairoConfigurationWrapper implements CairoConfiguration {
     private final AtomicReference<CairoConfiguration> delegate = new AtomicReference<>();
@@ -222,6 +226,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     @Override
     public int getColumnPurgeTaskPoolCapacity() {
         return getDelegate().getColumnPurgeTaskPoolCapacity();
+    }
+
+    @Override
+    public @Nullable ObjIntConsumer<ColumnPurgeTask> getColumnPurgeTruncateRefusalListener() {
+        return getDelegate().getColumnPurgeTruncateRefusalListener();
     }
 
     @Override
@@ -687,6 +696,16 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     @Override
     public long getMatViewRefreshMemoryLimitBytes() {
         return getDelegate().getMatViewRefreshMemoryLimitBytes();
+    }
+
+    @Override
+    public int getMatViewRowExpiryCleanupMaxCachedPartitions() {
+        return getDelegate().getMatViewRowExpiryCleanupMaxCachedPartitions();
+    }
+
+    @Override
+    public double getMatViewRowExpiryCleanupMinExpiredFraction() {
+        return getDelegate().getMatViewRowExpiryCleanupMinExpiredFraction();
     }
 
     @Override
@@ -1451,6 +1470,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public int getSqlMaxGroupingSets() {
+        return getDelegate().getSqlMaxGroupingSets();
+    }
+
+    @Override
     public int getSqlMaxNegativeLimit() {
         return getDelegate().getSqlMaxNegativeLimit();
     }
@@ -1961,6 +1985,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public boolean isCommitModeAdaptiveDowngrade() {
+        return getDelegate().isCommitModeAdaptiveDowngrade();
+    }
+
+    @Override
     public boolean isCopierChunkedEnabled() {
         return getDelegate().isCopierChunkedEnabled();
     }
@@ -2056,6 +2085,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public boolean isMatViewRowExpiryCleanupEnabled() {
+        return getDelegate().isMatViewRowExpiryCleanupEnabled();
+    }
+
+    @Override
     public boolean isMultiKeyDedupEnabled() {
         return getDelegate().isMultiKeyDedupEnabled();
     }
@@ -2118,6 +2152,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     @Override
     public boolean isSqlDistinctGroupByRewriteEnabled() {
         return getDelegate().isSqlDistinctGroupByRewriteEnabled();
+    }
+
+    @Override
+    public boolean isSqlLatestOnHoistEnabled() {
+        return getDelegate().isSqlLatestOnHoistEnabled();
     }
 
     @Override
@@ -2230,8 +2269,33 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public DeltaCheckpoint newDeltaCheckpoint() {
+        return getDelegate().newDeltaCheckpoint();
+    }
+
+    @Override
     public ParquetPartitionDecoder newParquetPartitionDecoder() {
         return getDelegate().newParquetPartitionDecoder();
+    }
+
+    @Override
+    public PartitionDeltaWriter newPartitionDeltaWriter() {
+        return getDelegate().newPartitionDeltaWriter();
+    }
+
+    @Override
+    public PartitionFrameDecoder newPartitionFrameDecoder() {
+        return getDelegate().newPartitionFrameDecoder();
+    }
+
+    @Override
+    public PartitionFrameStateFactory newPartitionFrameStateFactory(TableToken tableToken) {
+        return getDelegate().newPartitionFrameStateFactory(tableToken);
+    }
+
+    @Override
+    public AbstractTimestampFinder newTimestampFinder() {
+        return getDelegate().newTimestampFinder();
     }
 
     public void setDelegate(CairoConfiguration delegate) {
