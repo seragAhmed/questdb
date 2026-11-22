@@ -8003,6 +8003,8 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
             int pausedRetries = 0;
             boolean isFaultDue = false;
             boolean isLateSincePause = false;
+            // A restart rebuild the episode's suspension refused, which runs again after RESUME.
+            boolean isRestartRebuildPending = false;
             final boolean[] committedBeforePause = new boolean[rowCount];
             for (int c = 0; c < commitCount; c++) {
                 final boolean isStarting = episode < episodes && c == episodeStart[episode];
@@ -8015,12 +8017,17 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
                         setProperty(PropertyKey.CAIRO_WAL_APPLY_SUSPENDED_TABLES, null);
                     }
                     isFaultDue = rnd.nextInt(4) == 0;
+                    isRestartRebuildPending = false;
                     episode++;
                 }
                 // A removal of rows the view emitted before the pause, with no late row pending since: the
                 // drain after RESUME reads every pending row in order from the WAL, and the rest of the run
                 // commits in order, so no repair reads the base below the removal (freeze-and-continue).
-                if (isInside && !isAnchored && !isRemoved && !isLateSincePause && rnd.nextInt(5) == 0) {
+                // Nor while a restart rebuild is pending: it runs over the base as RESUME finds it, and the
+                // restatement guard stops a rebuild that would drop rows the view retains. Checked after the
+                // draw, so the draws of every other episode stay as they were.
+                if (isInside && !isAnchored && !isRemoved && !isLateSincePause && rnd.nextInt(5) == 0
+                        && !isRestartRebuildPending) {
                     final long day = removableDay(tsv, committedBeforePause);
                     if (day != Numbers.LONG_NULL) {
                         execute("ALTER TABLE base DROP PARTITION LIST '" + Micros.toString(day).substring(0, 10) + "'");
@@ -8144,9 +8151,10 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
                                     suspendLiveView(rnd);
                                 } else {
                                     capture.drain();
-                                    if (isWriteDenied
-                                            && countPauses(capture) > pausesBefore
-                                            && capture.countOccurrences("live view restart rebuild hit a retryable fault, retrying [view=lv") > restartRebuildsBefore) {
+                                    isRestartRebuildPending = capture.countOccurrences(
+                                            "live view restart rebuild hit a retryable fault, retrying [view=lv"
+                                    ) > restartRebuildsBefore;
+                                    if (isWriteDenied && countPauses(capture) > pausesBefore && isRestartRebuildPending) {
                                         shapes.add(SUSPENSION_SHAPE_REFUSED_RESTART_REBUILD);
                                     }
                                 }
