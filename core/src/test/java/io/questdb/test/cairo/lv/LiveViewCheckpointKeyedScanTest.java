@@ -1234,7 +1234,9 @@ public class LiveViewCheckpointKeyedScanTest extends AbstractLiveViewTest {
         // stays at zero for three partitions, so the posting budget alone walks all four,
         // while the setup of two partitions prices at 400 and of three at 600.
         assertMemoryLeak(() -> {
-            sqlExecutionContext.changePageFrameSizes(100, 100);
+            // A 1,000-row frame bound keeps every partition in one frame, the fourth's 101 rows
+            // included: a 100-row bound splits those into two frames.
+            sqlExecutionContext.changePageFrameSizes(1_000, 1_000);
             try {
                 execute("CREATE TABLE tx (created_at TIMESTAMP, account_id SYMBOL NOCACHE INDEX CAPACITY 4, "
                         + "amount DOUBLE) TIMESTAMP(created_at) PARTITION BY HOUR WAL");

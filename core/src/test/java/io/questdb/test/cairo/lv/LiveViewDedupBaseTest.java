@@ -3617,7 +3617,7 @@ public class LiveViewDedupBaseTest extends AbstractLiveViewTest {
      * the filter. The rebuild's output ends one step below the root the cadence sealed at the
      * largest timestamp, so the repair truncates the timeline at that timestamp and seals a root
      * one step below it, which each restart restores from.
-     *
+     * <p>
      * With {@link AfterLargestTimestampDeparture#CYCLE_WITHOUT_ROWS}, the base then drops the day
      * below, a commit the view puts no row through, past the duration cadence: the head stays on
      * the root at the new frontier, moves its base coordinate to that commit, and no root seals

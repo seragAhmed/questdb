@@ -1213,7 +1213,8 @@ public class LiveViewRebuildRestatementGuardTest extends AbstractLiveViewCheckpo
         // cancelled once the resume has restored its anchor and opened its cursors, which
         // consult the breaker too, and before its replay pulls a row. The breaker's throttle
         // then lets a later row of the replay find the flag, which the four rows committed above
-        // the anchor make sure it reaches.
+        // the anchor make sure it reaches. Each pass drives one turn: a notification pass can
+        // also run the lag scan, which would drive a second one.
         assertMemoryLeak(() -> {
             setProperty(PropertyKey.CAIRO_LIVE_VIEW_CHECKPOINT_REPAIR_MAX_CHAINED_BOUNDARIES, 0);
             seedSixRows("", "WHERE amount > 0");
@@ -1240,7 +1241,7 @@ public class LiveViewRebuildRestatementGuardTest extends AbstractLiveViewCheckpo
                 for (int pass = 0; pass < REFRESH_QUIESCENCE_PASSES && cancelled.getRefreshFaultCount() == 0; pass++) {
                     setCurrentMicros(currentMicros + CLOCK_ADVANCE_MICROS);
                     drainWalQueue();
-                    job.processNotificationsForTest();
+                    job.refreshInstanceForTest(cancelled, engine.getTableSequencerAPI().lastTxn(engine.verifyTableName("tx")));
                 }
             }
             Assert.assertTrue("the resume replay must have started", hasReplayStarted.get());
@@ -5976,7 +5977,8 @@ public class LiveViewRebuildRestatementGuardTest extends AbstractLiveViewCheckpo
      * trips the same breaker. Nothing consults the breaker ahead of the repair: the commit is out
      * of order, so the forward drain hands it to the repair before reading a row of it, and the
      * check that throws is the repair's own, past what its first turn settles before it replays.
-     * The instance keeps the flag, so the caller stops the process next.
+     * The instance keeps the flag, so the caller stops the process next. Each pass drives one
+     * turn: a notification pass can also run the lag scan, which would drive a second one.
      */
     private void cancelRefreshTurn(LiveViewInstance instance) {
         instance.cancelRefresh();
@@ -5984,7 +5986,7 @@ public class LiveViewRebuildRestatementGuardTest extends AbstractLiveViewCheckpo
             for (int pass = 0; pass < REFRESH_QUIESCENCE_PASSES && instance.getRefreshFaultCount() == 0; pass++) {
                 setCurrentMicros(currentMicros + CLOCK_ADVANCE_MICROS);
                 drainWalQueue();
-                job.processNotificationsForTest();
+                job.refreshInstanceForTest(instance, engine.getTableSequencerAPI().lastTxn(engine.verifyTableName("tx")));
             }
         }
         Assert.assertEquals("the breaker must have ended the replay exactly once", 1, instance.getRefreshFaultCount());

@@ -323,49 +323,49 @@ public class LiveViewCheckpointTimelineStoreWriter implements Closeable {
      * before its first write, and one that opens a seed history publishes beside it;
      * see {@code seedCursorOffset}.
      *
-     * @param batchMinTs       the lowest designated timestamp the runtime has
-     *                         processed since the current head boundary, or
-     *                         {@link Numbers#LONG_NULL} when the caller cannot say.
-     *                         A ring-shaped function shares the head root's chunk
-     *                         pages only when this proves the batch sits strictly
-     *                         above that boundary; anything weaker writes a complete
-     *                         state image, which costs more but cannot splice a prefix
-     *                         the runtime no longer holds. At or below the head's
-     *                         timestamp, it also drops the head root: that root holds
-     *                         only the part of its timestamp group the runtime had
-     *                         consumed when it was sealed, and the boundary appended
-     *                         here holds all of it. An unknown minimum drops nothing
-     * @param seedCursorOffset the seed sweep's base-cursor row offset when a
-     *                         mid-sweep cadence event drives this append, so a
-     *                         restart can resume the sweep from the root this
-     *                         publishes; {@link Numbers#LONG_NULL} for a steady
-     *                         cadence seal, which is what tells a restart the
-     *                         newest root is not a resume point. It also tells
-     *                         the history an append opens: a runtime one, which
-     *                         every restart weighs a repair marker against, opens
-     *                         only once no older history's marker is left beside
-     *                         it, and a seed one, whose readers never read the
-     *                         marker, opens beside one it cannot remove
-     * @param memoryTracker    the sealed view's refresh workload tracker, which
-     *                         the freeze scratch buffers charge while this
-     *                         append runs, or null to account against process
-     *                         totals only. The append frees the scratch and
-     *                         detaches the tracker before returning on every
-     *                         path, so no native capacity and no charge outlive it -
-     *                         the writer is shared across every view its worker
-     *                         seals
+     * @param batchMinTs              the lowest designated timestamp the runtime has
+     *                                processed since the current head boundary, or
+     *                                {@link Numbers#LONG_NULL} when the caller cannot say.
+     *                                A ring-shaped function shares the head root's chunk
+     *                                pages only when this proves the batch sits strictly
+     *                                above that boundary; anything weaker writes a complete
+     *                                state image, which costs more but cannot splice a prefix
+     *                                the runtime no longer holds. At or below the head's
+     *                                timestamp, it also drops the head root: that root holds
+     *                                only the part of its timestamp group the runtime had
+     *                                consumed when it was sealed, and the boundary appended
+     *                                here holds all of it. An unknown minimum drops nothing
+     * @param seedCursorOffset        the seed sweep's base-cursor row offset when a
+     *                                mid-sweep cadence event drives this append, so a
+     *                                restart can resume the sweep from the root this
+     *                                publishes; {@link Numbers#LONG_NULL} for a steady
+     *                                cadence seal, which is what tells a restart the
+     *                                newest root is not a resume point. It also tells
+     *                                the history an append opens: a runtime one, which
+     *                                every restart weighs a repair marker against, opens
+     *                                only once no older history's marker is left beside
+     *                                it, and a seed one, whose readers never read the
+     *                                marker, opens beside one it cannot remove
+     * @param memoryTracker           the sealed view's refresh workload tracker, which
+     *                                the freeze scratch buffers charge while this
+     *                                append runs, or null to account against process
+     *                                totals only. The append frees the scratch and
+     *                                detaches the tracker before returning on every
+     *                                path, so no native capacity and no charge outlive it -
+     *                                the writer is shared across every view its worker
+     *                                seals
      * @param repairRootCheckpointIds the ids of the roots the caller sealed only
-     *                         because a repair owed a root at its frontier, or null
-     *                         for none. When the generation's second-newest root is
-     *                         one of them, the appended boundary removes it in the
-     *                         generation it publishes: {@code [.., X, Y] + Z}
-     *                         publishes {@code [.., Y, Z]}. The removed root releases
-     *                         its segment references and logical state bytes as a
-     *                         replaced head does, and
-     *                         {@link Result#getRemovedCheckpointId()} names it. A
-     *                         seal that replaces the head removes nothing else; an id
-     *                         the timeline does not hold at that position removes
-     *                         nothing
+     *                                because a repair owed a root at its frontier, or null
+     *                                for none. When the generation's second-newest root is
+     *                                one of them, the appended boundary removes it in the
+     *                                generation it publishes: {@code [.., X, Y] + Z}
+     *                                publishes {@code [.., Y, Z]}. The removed root releases
+     *                                its segment references and logical state bytes as a
+     *                                replaced head does, and
+     *                                {@link Result#getRemovedCheckpointId()} names it. A
+     *                                seal that replaces the head removes nothing else; an id
+     *                                the timeline does not hold at that position removes
+     *                                nothing
      */
     public Result append(
             @Transient @NotNull Path checkpointsDir,

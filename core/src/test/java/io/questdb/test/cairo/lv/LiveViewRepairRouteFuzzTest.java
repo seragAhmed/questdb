@@ -1188,7 +1188,8 @@ public class LiveViewRepairRouteFuzzTest extends AbstractLiveViewTest {
             // rows'.
             final int[] keptMinutes = switch (dstShape) {
                 case DST_FRONTIER_IN_OPEN_RUN -> new int[]{-55, -50, -45, -40, -35, -25, -20, -15, -10, -5};
-                case DST_FRONTIER_IN_REPEATED_HALF_HOUR -> new int[]{-55, -50, -45, -40, -35, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25};
+                case DST_FRONTIER_IN_REPEATED_HALF_HOUR ->
+                        new int[]{-55, -50, -45, -40, -35, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25};
                 default -> new int[]{-12 * 60, -30, 0, 5, 10, 15, 20, 11 * 60};
             };
             final int[] departedMinutes = dstShape == DST_FRONTIER_ON_SPRING_FORWARD_DAY

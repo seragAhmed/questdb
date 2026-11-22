@@ -91,7 +91,7 @@ public class LiveViewLogTimestampSourceTest {
                         // $ts(ts) in a comment
                         LOG.info().$("$ts(ts) in a literal").I$();
                     }
-
+                
                     static void logKept(CharSequence viewName, final TimestampDriver driver, long ts) {
                         LOG.info().$("kept [view=").$(viewName).$(", ts=").$ts(driver, ts).I$();
                     }
@@ -112,14 +112,14 @@ public class LiveViewLogTimestampSourceTest {
                         LOG.info().$ts(ColumnType.getTimestampDriver(ColumnType.TIMESTAMP_MICRO), ts).I$();
                         LOG.info().$ts(driver, ts, 1).I$();
                     }
-
+                
                     void logLocal(CharSequence viewName, long ts) {
                         final TimestampDriver driver = MicrosTimestampDriver.INSTANCE;
                         LOG.info().$ts(driver, ts).I$();
                         logKept(viewName, MicrosTimestampDriver.INSTANCE, ts);
                         logKept(viewName);
                     }
-
+                
                     static void logKept(CharSequence viewName, TimestampDriver driver, long ts) {
                         LOG.info().$ts(driver, ts).I$();
                     }

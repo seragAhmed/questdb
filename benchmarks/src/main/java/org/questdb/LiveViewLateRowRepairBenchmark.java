@@ -168,20 +168,26 @@ public class LiveViewLateRowRepairBenchmark {
     @Benchmark
     public long lateRowRepair() throws SqlException {
         switch (late) {
-            case "ONE", "DENSE" -> execute("INSERT INTO base VALUES (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + "::timestamp, 's2', 1.0)");
-            case "SEGMENT_START", "SEGMENT_START_DENSE", "CLOSED_SEGMENT" -> execute("INSERT INTO base VALUES (" + DAY_ZERO_MICROS + "::timestamp, 's2', 1.0)");
-            case "LATE_WITH_CURRENT" -> execute("INSERT INTO base VALUES (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + "::timestamp, 's2', 1.0), ("
-                    + (rootTs(roots) + Micros.SECOND_MICROS) + "::timestamp, 's1', 1.0)");
-            case "NEW_BELOW" -> execute("INSERT INTO base SELECT (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + " + x)::timestamp, ('n' || x)::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
-            case "NEW_ACROSS" -> execute("INSERT INTO base SELECT CASE WHEN x = 1 THEN (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + ")::timestamp"
-                    + " ELSE (" + (firstRootTs() + 30 * Micros.SECOND_MICROS) + " + x)::timestamp END, ('n' || x)::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
+            case "ONE", "DENSE" ->
+                    execute("INSERT INTO base VALUES (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + "::timestamp, 's2', 1.0)");
+            case "SEGMENT_START", "SEGMENT_START_DENSE", "CLOSED_SEGMENT" ->
+                    execute("INSERT INTO base VALUES (" + DAY_ZERO_MICROS + "::timestamp, 's2', 1.0)");
+            case "LATE_WITH_CURRENT" ->
+                    execute("INSERT INTO base VALUES (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + "::timestamp, 's2', 1.0), ("
+                            + (rootTs(roots) + Micros.SECOND_MICROS) + "::timestamp, 's1', 1.0)");
+            case "NEW_BELOW" ->
+                    execute("INSERT INTO base SELECT (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + " + x)::timestamp, ('n' || x)::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
+            case "NEW_ACROSS" ->
+                    execute("INSERT INTO base SELECT CASE WHEN x = 1 THEN (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + ")::timestamp"
+                            + " ELSE (" + (firstRootTs() + 30 * Micros.SECOND_MICROS) + " + x)::timestamp END, ('n' || x)::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
             case "NEW_SPREAD" -> {
                 final long lo = firstRootTs() - 30 * Micros.SECOND_MICROS;
                 final long step = (rootTs(roots) - Micros.SECOND_MICROS - lo) / LATE_ROWS;
                 execute("INSERT INTO base SELECT (" + lo + " + x * " + step + ")::timestamp, ('n' || x)::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
             }
-            case "OLD" -> execute("INSERT INTO base SELECT (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + " + x)::timestamp,"
-                    + " ('s' || (((x - 1) % " + keys + ") + 1))::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
+            case "OLD" ->
+                    execute("INSERT INTO base SELECT (" + (firstRootTs() - 30 * Micros.SECOND_MICROS) + " + x)::timestamp,"
+                            + " ('s' || (((x - 1) % " + keys + ") + 1))::symbol, 1.0 FROM long_sequence(" + LATE_ROWS + ")");
             case "JITTERY" -> {
                 long frontier = rootTs(roots);
                 for (int batch = 0; batch < 100; batch++) {
@@ -302,11 +308,15 @@ public class LiveViewLateRowRepairBenchmark {
     private static String viewSql(String view) {
         final String anchor = " WINDOW w AS (PARTITION BY sym ORDER BY ts ANCHOR DAILY '00:00')";
         return switch (view) {
-            case "ROWS" -> "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) s FROM base";
-            case "RANGE24H" -> "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts RANGE BETWEEN '24' HOUR PRECEDING AND CURRENT ROW) s FROM base";
-            case "RANGE1M" -> "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts RANGE BETWEEN '1' MINUTE PRECEDING AND CURRENT ROW) s FROM base";
-            case "TWO_ROWS" -> "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) s,"
-                    + " avg(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) a FROM base";
+            case "ROWS" ->
+                    "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) s FROM base";
+            case "RANGE24H" ->
+                    "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts RANGE BETWEEN '24' HOUR PRECEDING AND CURRENT ROW) s FROM base";
+            case "RANGE1M" ->
+                    "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts RANGE BETWEEN '1' MINUTE PRECEDING AND CURRENT ROW) s FROM base";
+            case "TWO_ROWS" ->
+                    "SELECT ts, sym, x, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) s,"
+                            + " avg(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) a FROM base";
             case "ANCHOR_RANK" -> "SELECT ts, sym, x, rank() OVER w r FROM base" + anchor;
             case "ANCHOR_LAG" -> "SELECT ts, sym, x, lag(x) OVER w p FROM base" + anchor;
             case "ANCHOR_EXCLUDE_AVG" -> "SELECT ts, sym, x, avg(x) OVER w a FROM base"

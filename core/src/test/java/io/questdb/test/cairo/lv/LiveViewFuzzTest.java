@@ -3363,8 +3363,8 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
      * {@code _timeline} goes instead, which refuses that first seal: see
      * {@link #refuseTheHistoryBesideALockedMarker}. Draws from {@code episodeRnd} alone.
      *
-     * @param keptTs              the kept batch's timestamps, below the departed one's
-     * @param sealFailuresBefore  the seal failures the view counted ahead of the departure
+     * @param keptTs             the kept batch's timestamps, below the departed one's
+     * @param sealFailuresBefore the seal failures the view counted ahead of the departure
      */
     private void runKeptTimelineEpisode(
             Rnd episodeRnd,
@@ -3704,11 +3704,11 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
      * leave as they do in departNewestRows. A rebuild that emits no row over the root at the new
      * frontier puts the head back on that root, by a re-stamp that names no root.
      *
-     * @param frameMinutes         the width of the view's RANGE frame, in minutes
-     * @param isKeptPrefixSealed   whether a root seals the kept batch's first three rows alone, for
-     *                             {@link #SPARSE_DEPARTURE_FRONTIER_SEAL}
-     * @param isFrontierSealFailed whether the frontier seal of {@link #SPARSE_DEPARTURE_FRONTIER_SEAL}
-     *                             fails
+     * @param frameMinutes                 the width of the view's RANGE frame, in minutes
+     * @param isKeptPrefixSealed           whether a root seals the kept batch's first three rows alone, for
+     *                                     {@link #SPARSE_DEPARTURE_FRONTIER_SEAL}
+     * @param isFrontierSealFailed         whether the frontier seal of {@link #SPARSE_DEPARTURE_FRONTIER_SEAL}
+     *                                     fails
      * @param isTimelineLockedForTheRetire whether the retire that answers the failed frontier seal
      *                                     meets a lock on {@code _timeline}, which keeps the
      *                                     timeline and its live marker
@@ -7936,7 +7936,7 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
         final int preCount = rnd.nextInt(3) == 0 ? 1 + rnd.nextInt(rowCount / 2) : 0;
         final String viewSql = isAnchored
                 ? "SELECT " + anchoredViewProjection(variant) + " FROM base WINDOW w AS (PARTITION BY sym ORDER BY ts "
-                + anchoredWindowFrame(variant) + "ANCHOR EXPRESSION " + bucket + ")"
+                  + anchoredWindowFrame(variant) + "ANCHOR EXPRESSION " + bucket + ")"
                 : "SELECT " + projection(variant, n) + " FROM base";
         final String oracleFrom = isAnchored ? "SELECT " + anchoredOracleProjection(variant, bucket) + " FROM " : "SELECT " + projection(variant, n) + " FROM ";
 

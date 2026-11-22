@@ -171,6 +171,8 @@ public class LiveViewServerRestartTest extends AbstractBootstrapTest {
         // hydrator starts from - and drives the upsert through the server while the base is
         // still missing from it. The two cold-catalogue checks around the upsert keep the case
         // honest: something that warmed the base in between would make it a test of nothing.
+        // That server runs without the row-expiry cleanup job, whose discovery hydrates every
+        // table while the catalogue is incomplete.
         assertMemoryLeak(() -> {
             final long frontierTs = seedTs(DEDUP_SEED_ROWS - 1);
             final String beforeRestart;
@@ -187,7 +189,7 @@ public class LiveViewServerRestartTest extends AbstractBootstrapTest {
                 beforeRestart = readRows(conn, viewRowsSql(DEDUP_VIEW));
             }
 
-            try (TestServerMain serverMain = startServer(); Connection conn = connect()) {
+            try (TestServerMain serverMain = startServerWithoutRowExpiryCleanup(); Connection conn = connect()) {
                 serverMain.awaitStartup();
                 final CairoEngine engine = serverMain.getEngine();
                 assertRestartRestoredFromTimeline(serverMain, conn, DEDUP_VIEW);
@@ -903,6 +905,18 @@ public class LiveViewServerRestartTest extends AbstractBootstrapTest {
                 PropertyKey.LIVE_VIEW_REFRESH_WORKER_COUNT.getEnvVarName(), "2",
                 PropertyKey.CAIRO_LIVE_VIEW_CHECKPOINT_ROWS.getEnvVarName(), String.valueOf(checkpointRows),
                 PropertyKey.CAIRO_LIVE_VIEW_CHECKPOINT_MAX_DURATION_MICROS.getEnvVarName(), String.valueOf(checkpointMaxDurationMicros),
+                PropertyKey.HTTP_MIN_ENABLED.getEnvVarName(), "false",
+                PropertyKey.LINE_TCP_ENABLED.getEnvVarName(), "false"
+        );
+    }
+
+    // As startServer(), without the row-expiry cleanup job.
+    private TestServerMain startServerWithoutRowExpiryCleanup() {
+        return startWithEnvVariables(
+                PropertyKey.CAIRO_LIVE_VIEW_ENABLED.getEnvVarName(), "true",
+                PropertyKey.LIVE_VIEW_REFRESH_WORKER_COUNT.getEnvVarName(), "2",
+                PropertyKey.CAIRO_LIVE_VIEW_CHECKPOINT_ROWS.getEnvVarName(), String.valueOf(CHECKPOINT_ROWS),
+                PropertyKey.CAIRO_MAT_VIEW_ROW_EXPIRY_CLEANUP_ENABLED.getEnvVarName(), "false",
                 PropertyKey.HTTP_MIN_ENABLED.getEnvVarName(), "false",
                 PropertyKey.LINE_TCP_ENABLED.getEnvVarName(), "false"
         );

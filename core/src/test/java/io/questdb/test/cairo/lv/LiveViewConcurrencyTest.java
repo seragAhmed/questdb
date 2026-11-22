@@ -1824,9 +1824,11 @@ public class LiveViewConcurrencyTest extends AbstractLiveViewTest {
                         barrier.await(REFRESH_TICK_WAIT_NANOS, TimeUnit.NANOSECONDS);
                         for (int t = 0; t < toggleCount && errors.isEmpty(); t++) {
                             switch (operatorRnd.nextInt(4)) {
-                                case 0 -> execute("ALTER LIVE VIEW lv SUSPEND WAL WITH 'DISK FULL', 'operator " + t + "'", context);
+                                case 0 ->
+                                        execute("ALTER LIVE VIEW lv SUSPEND WAL WITH 'DISK FULL', 'operator " + t + "'", context);
                                 case 1 -> execute("ALTER LIVE VIEW lv RESUME WAL", context);
-                                case 2 -> setProperty(PropertyKey.CAIRO_WAL_APPLY_SUSPENDED_TABLES, lvToken.getDirName());
+                                case 2 ->
+                                        setProperty(PropertyKey.CAIRO_WAL_APPLY_SUSPENDED_TABLES, lvToken.getDirName());
                                 default -> setProperty(PropertyKey.CAIRO_WAL_APPLY_SUSPENDED_TABLES, null);
                             }
                             for (int spin = operatorRnd.nextInt(2_000); spin > 0; spin--) {

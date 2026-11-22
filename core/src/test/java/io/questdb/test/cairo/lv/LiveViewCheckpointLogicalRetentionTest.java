@@ -12050,8 +12050,8 @@ public class LiveViewCheckpointLogicalRetentionTest extends AbstractLiveViewTest
                     isHeadMiss
                             ? "2025-12-31T23:55:00.000000Z -> 1\n"
                             : isDayLost
-                            ? "2025-12-31T12:00:00.000000Z -> 1\n2026-01-01T00:01:00.000000Z -> 2\n"
-                            : "2026-01-01T00:01:00.000000Z -> 1\n"
+                              ? "2025-12-31T12:00:00.000000Z -> 1\n2026-01-01T00:01:00.000000Z -> 2\n"
+                              : "2026-01-01T00:01:00.000000Z -> 1\n"
             );
         }
         assertMarkerNames(spliceGeneration);
