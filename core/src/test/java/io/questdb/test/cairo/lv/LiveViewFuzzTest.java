@@ -1561,7 +1561,7 @@ public class LiveViewFuzzTest extends AbstractLiveViewTest {
         // once landed below it too, so a repair sealed that batch as well, and the episode failed.
         runReplaceRangeFuzzVariants(TestUtils.generateRandom(LOG, 483053825472492L, 1793712138610L), true);
         Assert.assertTrue(
-                "no unsealed departure started below the newest timestamp the view had seen",
+                "no unsealed departure had its kept batch below the newest timestamp the view had seen",
                 unsealedDeparturesBelowLatestSeenTs > 0
         );
     }

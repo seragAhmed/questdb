@@ -177,10 +177,10 @@ public abstract class AbstractLiveViewTest extends AbstractCairoTest {
     }
 
     /**
-     * Scales a soak/fuzz redundancy count down on Windows (see {@link #isReducedWindowsLoad}),
+     * Scales a soak redundancy count down on Windows (see {@link #isReducedWindowsLoad}),
      * never below {@code min}, and leaves it untouched on every other platform. Only pure
-     * redundancy counts - rows a soak churns, runs a fuzz repeats - pass through here; a count a
-     * test asserts against or a threshold it must cross never does.
+     * redundancy counts, such as the rows a soak churns, pass through here; a count a test
+     * asserts against or a threshold it must cross never does.
      */
     protected static int reducedOnWindows(int full, int min) {
         return isReducedWindowsLoad ? Math.max(min, full / 2) : full;
